@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# local tool + app settings, not for sharing
+.claude/
+.dropzone.json
+
+.DS_Store
