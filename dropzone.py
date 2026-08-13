@@ -12,15 +12,20 @@ shell snippet. Paste that snippet into any VPS shell, then run:
 
 ...and the files land in your DropZone folder. No SSH keys, no scp syntax.
 
+There are two front ends over the same engine, and no GUI toolkit in either:
+
+    python3 dropzone.py                 # control panel in your browser
+    python3 dropzone.py --headless      # same controls, from this terminal
+
+The control panel is a plain page served on 127.0.0.1 only - the tunnel never
+sees it. Type `help` at the headless prompt for the terminal equivalent.
+
 `.git`, `node_modules` and `.env` are skipped by default - edit "Never send"
-in the GUI, pass --exclude, or override per call on the remote box:
+in the panel, `exclude ...` at the prompt, pass --exclude, or override per
+call on the remote box:
 
     DZ_EXCLUDE=".git" send /var/www/html     # keep .env this time
     DZ_EXCLUDE= send /var/www/html           # send absolutely everything
-
-    python3 dropzone.py                 # GUI
-    python3 dropzone.py --headless      # terminal only
-    python3 dropzone.py --tunnel off    # LAN / Tailscale / port-forward only
 
 Want a stable address instead of a random trycloudflare.com one? Point a
 domain you own at DropZone:
@@ -28,8 +33,9 @@ domain you own at DropZone:
     python3 dropzone.py --tunnel domain --hostname drop.example.com
     python3 dropzone.py --tunnel token  --hostname drop.example.com \\
                         --tunnel-token eyJhIjoi...
+    python3 dropzone.py --tunnel off         # LAN / Tailscale only
 
-The GUI has a Connection panel that does the same thing without flags.
+Both front ends can do the same thing without any flags.
 """
 
 import argparse
@@ -45,13 +51,11 @@ import sys
 import tarfile
 import threading
 import time
+import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
-
-# Tk on macOS is the deprecated system build; the warning is noise to our users.
-os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+from urllib.parse import parse_qs, unquote, urlparse
 
 # --------------------------------------------------------------------------
 # state
@@ -83,6 +87,45 @@ def human(n):
         if n < 1024 or unit == "GB":
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024
+
+
+def tilde(path):
+    """~/DropZone/foo reads better in a log than /Users/someone/DropZone/foo."""
+    try:
+        return "~/" + str(Path(path).relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def in_dest(path):
+    """Log paths as the user thinks of them: relative to the DropZone folder."""
+    try:
+        return str(Path(path).relative_to(DEST))
+    except ValueError:
+        return tilde(path)
+
+
+LIST_LIMIT = 20     # per-file log lines before we summarise the rest
+
+
+def log_landed(path):
+    """Name every file that just landed, so the log says what was copied."""
+    try:
+        if path.is_file():
+            log(f"copied  {in_dest(path)}  {human(path.stat().st_size)}")
+            return
+        files = sorted(p for p in path.rglob("*") if p.is_file())
+        total = 0
+        for i, p in enumerate(files):
+            size = p.stat().st_size
+            total += size
+            if i < LIST_LIMIT:
+                log(f"   + {p.relative_to(path)}  {human(size)}")
+        if len(files) > LIST_LIMIT:
+            log(f"   + ... and {len(files) - LIST_LIMIT} more files")
+        log(f"copied  {in_dest(path)}/  {len(files)} files  {human(total)}")
+    except Exception as e:
+        log(f"copied  {in_dest(path)}  (could not list contents: {e})")
 
 
 def safe_name(raw):
@@ -230,10 +273,14 @@ class Receiver(BaseHTTPRequestHandler):
 
             have = sorted(p for p in pdir.iterdir() if p.name.startswith("p")
                           and not p.name.endswith(".part"))
-            log(f"got {base} part {int(idx) + 1}/{total}  {human(n)}")
-            if len(have) >= total:
+            done = len(have) >= total
+            log(f"receiving {base}  part {int(idx) + 1}/{total}  {human(n)}")
+            if done:
                 self._assemble(pdir, base, have)
-            return self._reply(200, b"ok\n")
+                return self._reply(200, f"\nsent  {base}\n".encode())
+            # leading \n: curl's progress meter leaves the cursor mid-line
+            return self._reply(
+                200, f"\nsent  {base} part {int(idx) + 1}/{total}\n".encode())
 
         # ---- single-shot upload --------------------------------------
         target = unique_path(DEST / name)
@@ -245,11 +292,13 @@ class Receiver(BaseHTTPRequestHandler):
             return self._reply(500, b"failed\n")
 
         secs = max(time.time() - start, 0.001)
-        log(f"got {target.name}  {human(n)}  ({human(n / secs)}/s)")
+        log(f"received {target.name}  {human(n)}  ({human(n / secs)}/s)")
 
         if AUTO_EXTRACT and target.name.endswith((".tgz", ".tar.gz")):
             self._extract(target)
-        return self._reply(200, b"ok\n")
+        else:
+            log_landed(target)
+        return self._reply(200, f"\nsent  {name}  {human(n)}\n".encode())
 
     def _assemble(self, pdir, base, parts):
         joined = unique_path(DEST / base)
@@ -269,6 +318,8 @@ class Receiver(BaseHTTPRequestHandler):
             return
         if AUTO_EXTRACT and joined.name.endswith((".tgz", ".tar.gz")):
             self._extract(joined)
+        else:
+            log_landed(joined)
 
     def _extract(self, archive):
         label = archive.name.replace(".tar.gz", "").replace(".tgz", "")
@@ -291,11 +342,11 @@ class Receiver(BaseHTTPRequestHandler):
                 shutil.move(str(staging), str(final))
 
             archive.unlink()
-            suffix = "/" if final.is_dir() else ""
-            log(f"unpacked -> {final.name}{suffix}")
+            log_landed(final)
         except Exception as e:
             shutil.rmtree(staging, ignore_errors=True)
             log(f"kept archive (extract failed: {e})")
+            log_landed(archive)
 
     def do_GET(self):
         self._reply(200, b"DropZone is listening.\n")
@@ -492,7 +543,7 @@ def cf_login(on_done):
     threading.Thread(target=work, daemon=True).start()
 
 
-def connect(port, mode, hostname="", name="dropzone", token="", url=""):
+def bring_up(port, mode, hostname="", name="dropzone", token="", url=""):
     """Bring up whatever the chosen mode needs and return the public base URL."""
     stop_tunnel()
     if mode == "quick":
@@ -581,241 +632,661 @@ def chunk_for(mode, base, override="auto"):
 
 
 # --------------------------------------------------------------------------
-# gui
+# modes
 # --------------------------------------------------------------------------
 
 MODES = [
-    ("quick",  "Cloudflare quick tunnel  (random URL, no account)"),
-    ("domain", "My domain via Cloudflare  (needs a Cloudflare account)"),
-    ("token",  "Cloudflare tunnel token  (from the Zero Trust dashboard)"),
-    ("direct", "Direct / LAN  (no tunnel)"),
-    ("url",    "Custom URL  (your own proxy or port-forward)"),
+    {"id": "quick", "name": "Cloudflare quick tunnel",
+     "note": "random URL, no account", "fields": [],
+     "hint": "A throwaway https URL from Cloudflare. Changes every run."},
+    {"id": "domain", "name": "My domain via Cloudflare",
+     "note": "needs a Cloudflare account", "fields": ["hostname", "tunnel_name"],
+     "hint": "Uses a domain already on your Cloudflare account. Log in once, "
+             "then DropZone creates the tunnel and the DNS record for you."},
+    {"id": "token", "name": "Cloudflare tunnel token",
+     "note": "from the Zero Trust dashboard", "fields": ["hostname", "tunnel_token"],
+     "hint": "Create the tunnel at one.dash.cloudflare.com (Networks > Tunnels), "
+             "point its public hostname at http://127.0.0.1:{port}, then paste "
+             "the token here."},
+    {"id": "direct", "name": "Direct / LAN",
+     "note": "no tunnel", "fields": [],
+     "hint": "Reachable only from this network - LAN, Tailscale, or your own "
+             "port-forward. No 100MB request cap."},
+    {"id": "url", "name": "Custom URL",
+     "note": "your own proxy or port-forward", "fields": ["url"],
+     "hint": "Already have DropZone reachable somewhere? Enter that base URL and "
+             "DropZone will just print the matching command."},
 ]
-MODE_LABELS = [label for _, label in MODES]
-LABEL_TO_MODE = {label: mode for mode, label in MODES}
-MODE_TO_LABEL = dict(MODES)
+MODE_IDS = [m["id"] for m in MODES]
+FIELD_LABELS = {"hostname": "Hostname", "tunnel_name": "Tunnel name",
+                "tunnel_token": "Tunnel token", "url": "Base URL"}
 
 
-def run_gui(base_url, chunk_mb, port, cfg, chunk_override="auto", note=""):
-    # Classic tk widgets only: Apple's deprecated system Tk 8.5 draws ttk
-    # widgets as an empty window on current macOS.
-    import tkinter as tk
-    from tkinter import scrolledtext
+def mode_info(mode_id):
+    for m in MODES:
+        if m["id"] == mode_id:
+            return m
+    return MODES[0]
 
-    root = tk.Tk()
-    root.title("DropZone")
-    root.geometry("760x680")
-    root.minsize(660, 560)
 
-    state = {"base": base_url, "chunk": chunk_mb, "cmd": snippet(base_url, chunk_mb)}
+def log_class(msg):
+    """Which colour a log line gets, in the browser and in the terminal."""
+    low = msg.lower()
+    if msg.startswith("   +"):
+        return "dim"
+    if "failed" in low or low.startswith("could not"):
+        return "bad"
+    if low.startswith(("copied", "sent", "joined", "unpacked", "listening")):
+        return "ok"
+    if low.startswith(("receiving", "connecting", "switching", "opening",
+                       "starting", "waiting", "creating", "routing")):
+        return "warn"
+    return "msg"
 
-    # -- 1. connection ---------------------------------------------------
-    conn = tk.LabelFrame(root, text=" Connection ", padx=4, pady=4)
-    conn.pack(fill="x", padx=14, pady=(12, 0))
-    conn.columnconfigure(1, weight=1)
 
-    mode_var = tk.StringVar(value=MODE_TO_LABEL.get(cfg.get("mode", "quick"),
-                                                    MODE_TO_LABEL["quick"]))
-    host_var = tk.StringVar(value=cfg.get("hostname", ""))
-    name_var = tk.StringVar(value=cfg.get("tunnel_name", "dropzone"))
-    token_var = tk.StringVar(value=cfg.get("tunnel_token", ""))
-    url_var = tk.StringVar(value=cfg.get("url", ""))
-    conn_status = tk.StringVar()
+# --------------------------------------------------------------------------
+# event bus - one log line goes to every open browser tab
+# --------------------------------------------------------------------------
 
-    tk.Label(conn, text="Mode").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
-    picker = tk.OptionMenu(conn, mode_var, *MODE_LABELS)
-    picker.configure(anchor="w", highlightthickness=0)
-    picker.grid(row=0, column=1, sticky="ew", padx=10, pady=(8, 4))
+class Bus:
+    def __init__(self):
+        self.clients = []
+        self.lock = threading.Lock()
 
-    def field(row, text, var, show=None):
-        lab = tk.Label(conn, text=text)
-        ent = tk.Entry(conn, textvariable=var, show=show,
-                       relief="solid", bd=1, highlightthickness=0)
-        lab.grid(row=row, column=0, sticky="w", padx=10, pady=3)
-        ent.grid(row=row, column=1, sticky="ew", padx=10, pady=3, ipady=3)
-        return lab, ent
+    def subscribe(self):
+        q = queue.Queue(maxsize=2000)
+        with self.lock:
+            self.clients.append(q)
+        return q
 
-    host_row = field(1, "Hostname", host_var)
-    name_row = field(2, "Tunnel name", name_var)
-    token_row = field(3, "Tunnel token", token_var, show="*")
-    url_row = field(4, "Base URL", url_var)
+    def unsubscribe(self, q):
+        with self.lock:
+            if q in self.clients:
+                self.clients.remove(q)
 
-    hint = tk.Label(conn, text="", fg="#666", wraplength=690,
-                    justify="left", anchor="w")
-    hint.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 0))
-
-    btns = tk.Frame(conn)
-    btns.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 6))
-    apply_btn = tk.Button(btns, text="Apply", width=10)
-    apply_btn.pack(side="left")
-    login_btn = tk.Button(btns, text="Log in to Cloudflare", width=18)
-    login_btn.pack(side="left", padx=8)
-    tk.Label(btns, textvariable=conn_status, fg="#666", anchor="w").pack(side="left", padx=6)
-
-    HINTS = {
-        "quick": "A throwaway https URL from Cloudflare. Changes every run.",
-        "domain": "Uses a domain already on your Cloudflare account. Log in once, "
-                  "then DropZone creates the tunnel and the DNS record for you.",
-        "token": "Create the tunnel at one.dash.cloudflare.com (Networks > Tunnels), "
-                 "point its public hostname at http://127.0.0.1:%d, then paste the "
-                 "token here." % port,
-        "direct": "Reachable only from this network - LAN, Tailscale, or your own "
-                  "port-forward. No 100MB request cap.",
-        "url": "Already have DropZone reachable somewhere? Enter that base URL and "
-               "DropZone will just print the matching command.",
-    }
-
-    def current_mode():
-        return LABEL_TO_MODE.get(mode_var.get(), "quick")
-
-    def refresh_fields(*_):
-        mode = current_mode()
-        for rows, modes in ((host_row, {"domain", "token"}),
-                            (name_row, {"domain"}),
-                            (token_row, {"token"}),
-                            (url_row, {"url"})):
-            for w in rows:
-                w.grid() if mode in modes else w.grid_remove()
-        hint.configure(text=HINTS[mode])
-        login_btn.configure(state="normal" if mode == "domain" else "disabled")
-
-    mode_var.trace_add("write", refresh_fields)
-    refresh_fields()
-
-    # -- 2. the snippet ---------------------------------------------------
-    tk.Label(root, text="1.  Paste this into your VPS shell",
-             font=("TkDefaultFont", 11, "bold"), anchor="w"
-             ).pack(fill="x", padx=14, pady=(12, 0))
-
-    skip = tk.Frame(root)
-    skip.pack(fill="x", padx=14, pady=(4, 0))
-    tk.Label(skip, text="Never send").pack(side="left")
-    excl_var = tk.StringVar(value=cfg.get("exclude", DEFAULT_EXCLUDE))
-    tk.Entry(skip, textvariable=excl_var, relief="solid", bd=1,
-             highlightthickness=0).pack(side="left", fill="x", expand=True,
-                                        padx=8, ipady=2)
-    tk.Label(skip, text="space-separated, e.g.  .git node_modules .env",
-             fg="#666").pack(side="left")
-
-    box = tk.Text(root, height=6, wrap="word", font=("Courier", 10),
-                  relief="solid", bd=1)
-    box.insert("1.0", state["cmd"])
-    box.configure(state="disabled")
-    box.pack(fill="x", padx=14, pady=(4, 0))
-
-    bar = tk.Frame(root)
-    bar.pack(fill="x", padx=14, pady=8)
-    status = tk.StringVar()
-
-    def copy():
-        root.clipboard_clear()
-        root.clipboard_append(state["cmd"])
-        status.set("copied to clipboard")
-
-    tk.Button(bar, text="Copy command", command=copy, width=14).pack(side="left")
-    tk.Button(bar, text="Open folder",
-              command=lambda: open_folder(DEST), width=12).pack(side="left", padx=8)
-    tk.Label(bar, textvariable=status, fg="#666").pack(side="left", padx=6)
-
-    tk.Label(root, text="2.  Then:   peek /path   to list what would go, "
-                        "then   send /path",
-             font=("TkDefaultFont", 11, "bold"), anchor="w").pack(fill="x", padx=14)
-
-    out = scrolledtext.ScrolledText(root, height=12, font=("Courier", 9),
-                                    state="disabled", relief="solid", bd=1)
-    out.pack(fill="both", expand=True, padx=14, pady=(6, 12))
-
-    def sink(line):
-        def append():
-            out.configure(state="normal")
-            out.insert("end", line + "\n")
-            out.see("end")
-            out.configure(state="disabled")
-        root.after(0, append)
-
-    # -- wiring -----------------------------------------------------------
-    def show_snippet(base=None, chunk=None):
-        base = state["base"] if base is None else base
-        chunk = state["chunk"] if chunk is None else chunk
-        state.update(base=base, chunk=chunk,
-                     cmd=snippet(base, chunk, excl_var.get()))
-        box.configure(state="normal")
-        box.delete("1.0", "end")
-        box.insert("1.0", state["cmd"])
-        box.configure(state="disabled")
-        note = f"  ·  split into {chunk}MB requests" if chunk else ""
-        status.set(f"listening on {base}{note}")
-
-    excl_var.trace_add("write", lambda *_: show_snippet())
-
-    def apply():
-        mode = current_mode()
-        settings = dict(mode=mode, hostname=clean_host(host_var.get()),
-                        tunnel_name=name_var.get().strip() or "dropzone",
-                        tunnel_token=token_var.get().strip(),
-                        url=url_var.get().strip(),
-                        exclude=excl_var.get().strip())
-        apply_btn.configure(state="disabled")
-        conn_status.set("connecting ...")
-
-        def work():
+    def publish(self, kind, data):
+        msg = json.dumps({"kind": kind, "data": data})
+        with self.lock:
+            clients = list(self.clients)
+        for q in clients:
             try:
-                base = connect(port, mode, settings["hostname"],
-                               settings["tunnel_name"], settings["tunnel_token"],
-                               settings["url"])
-                chunk = chunk_for(mode, base, chunk_override)
-                save_config(settings)
-                root.after(0, lambda: (conn_status.set("connected"),
-                                       host_var.set(settings["hostname"]),
-                                       show_snippet(base, chunk),
-                                       log(f"listening on {base}")))
-            except TunnelError as e:
-                # connect() already tore the old tunnel down, so the previous
-                # URL is dead - show the address that actually still works.
-                msg, fallback = str(e), f"http://{lan_ip()}:{port}"
-                root.after(0, lambda: (
-                    conn_status.set(f"{msg} - showing local address"),
-                    log(f"connect failed: {msg}"),
-                    show_snippet(fallback, chunk_for("direct", fallback, chunk_override))))
-            finally:
-                root.after(0, lambda: apply_btn.configure(state="normal"))
+                q.put_nowait(msg)
+            except queue.Full:
+                pass        # a tab that cannot keep up loses lines, not the app
 
-        threading.Thread(target=work, daemon=True).start()
 
-    def login():
-        login_btn.configure(state="disabled")
-        conn_status.set("waiting for the browser ...")
+BUS = Bus()
+
+
+# --------------------------------------------------------------------------
+# app state - both front ends drive this one object
+# --------------------------------------------------------------------------
+
+class App:
+    def __init__(self, port, cfg, chunk_override="auto"):
+        self.port = port
+        self.chunk_override = chunk_override
+        self.mode = cfg.get("mode", "quick")
+        self.hostname = cfg.get("hostname", "")
+        self.tunnel_name = cfg.get("tunnel_name", "dropzone") or "dropzone"
+        self.tunnel_token = cfg.get("tunnel_token", "")
+        self.url = cfg.get("url", "")
+        self.exclude = cfg.get("exclude", DEFAULT_EXCLUDE)
+        self.base = f"http://{lan_ip()}:{port}"
+        self.chunk = 0
+        self.health = "idle"            # idle | busy | live | error
+        self.status = "starting"
+        self.busy = False
+
+    # -- settings --------------------------------------------------------
+    def settings(self):
+        return dict(mode=self.mode, hostname=self.hostname,
+                    tunnel_name=self.tunnel_name, tunnel_token=self.tunnel_token,
+                    url=self.url, exclude=self.exclude)
+
+    def update(self, **kw):
+        for key in ("mode", "hostname", "tunnel_name", "tunnel_token", "url",
+                    "exclude"):
+            if key in kw and kw[key] is not None:
+                setattr(self, key, str(kw[key]).strip())
+        if self.mode not in MODE_IDS:
+            self.mode = "quick"
+        self.hostname = clean_host(self.hostname)
+        self.tunnel_name = self.tunnel_name or "dropzone"
+
+    def save(self):
+        save_config(self.settings())
+
+    def snippet(self):
+        return snippet(self.base, self.chunk, self.exclude)
+
+    def as_dict(self):
+        return {
+            "modes": MODES, "fieldLabels": FIELD_LABELS, "mode": self.mode,
+            "hostname": self.hostname, "tunnel_name": self.tunnel_name,
+            "tunnel_token": self.tunnel_token, "url": self.url,
+            "exclude": self.exclude, "base": self.base, "chunk": self.chunk,
+            "snippet": self.snippet(), "dest": tilde(DEST), "port": self.port,
+            "health": self.health, "status": self.status, "busy": self.busy,
+            "cloudflared": bool(cloudflared()), "cfLoggedIn": cf_logged_in(),
+            "installHint": INSTALL_HINT,
+            "hint": mode_info(self.mode)["hint"].replace("{port}", str(self.port)),
+        }
+
+    def push(self):
+        BUS.publish("state", self.as_dict())
+
+    # -- actions ---------------------------------------------------------
+    def set_exclude(self, patterns):
+        self.exclude = " ".join((patterns or "").split())
+        self.save()
+        self.push()
+
+    def apply(self, **kw):
+        """Bring the chosen mode up. Blocking; returns (ok, message)."""
+        self.update(**kw)
+        self.busy, self.health = True, "busy"
+        self.status = "connecting ..."
+        self.push()
+        log(f"switching to {mode_info(self.mode)['name']} ...")
+        try:
+            self.base = bring_up(self.port, self.mode, self.hostname,
+                                 self.tunnel_name, self.tunnel_token, self.url)
+            self.chunk = chunk_for(self.mode, self.base, self.chunk_override)
+            self.health, self.status = "live", f"listening on {self.base}"
+            self.save()
+            log(f"listening on {self.base}")
+            result = (True, self.status)
+        except TunnelError as e:
+            # bring_up() already tore the old tunnel down, so the previous URL
+            # is dead - fall back to the address that actually still works.
+            self.base = f"http://{lan_ip()}:{self.port}"
+            self.chunk = chunk_for("direct", self.base, self.chunk_override)
+            self.health = "error"
+            self.status = f"{e} - showing this machine's local address"
+            log(f"connect failed: {e}")
+            log(f"local address only: {self.base}")
+            result = (False, str(e))
+        except Exception as e:                  # never get stuck on "connecting"
+            self.health = "error"
+            self.status = f"{type(e).__name__}: {e}"
+            log(f"connect failed: {self.status}")
+            result = (False, self.status)
+        finally:
+            self.busy = False
+            self.push()
+        return result
+
+    def apply_async(self, **kw):
+        threading.Thread(target=lambda: self.apply(**kw), daemon=True).start()
+
+    def login_async(self):
+        self.busy, self.health = True, "busy"
+        self.status = "waiting for the browser ..."
+        self.push()
 
         def done(ok, msg):
-            root.after(0, lambda: (conn_status.set(msg),
-                                   login_btn.configure(state="normal")))
+            self.busy = False
+            self.health = "live" if ok else "error"
+            self.status = msg
+            self.push()
+
         cf_login(done)
 
-    apply_btn.configure(command=apply)
-    login_btn.configure(command=login)
 
-    for past in LOG_HISTORY:        # startup happens before this sink exists
-        sink(past)
-    LOG_SINKS.append(sink)
-    show_snippet(base_url, chunk_mb)
-    log(f"saving to {DEST}")
-    log(f"listening on {base_url}")
-    if note:
-        conn_status.set(note)
-    elif not cloudflared():
-        conn_status.set(f"cloudflared not found - {INSTALL_HINT}")
+# --------------------------------------------------------------------------
+# the page
+# --------------------------------------------------------------------------
 
-    def quit_app():
-        save_config({**cfg, "exclude": excl_var.get().strip()})
-        stop_tunnel()
-        root.destroy()
+PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DropZone</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M16 6v13m0 0l-5-5m5 5l5-5M8 25h16' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<style>
+:root{
+  --bg:#f4f6fb; --card:#fff; --line:#e3e8f0; --ink:#0f172a; --mute:#5b6577;
+  --faint:#94a0b3; --accent:#2563eb; --accent-ink:#fff; --accent-soft:#e8eefc;
+  --good:#059669; --bad:#dc2626; --warn:#b45309;
+  --panel:#0f172a; --panel-ink:#e2e8f0; --panel-line:#1e2b45;
+  --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0a0f1d; --card:#121a2c; --line:#22304a; --ink:#e8edf7; --mute:#9aa8bf;
+    --faint:#6b7a93; --accent:#4f83f1; --accent-soft:#1a2743; --good:#34d399;
+    --bad:#f87171; --warn:#fbbf24; --panel:#070d19; --panel-line:#1c2842;
+    --shadow:none;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:960px;margin:0 auto;padding:28px 22px 40px}
+header{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;
+  margin-bottom:20px;flex-wrap:wrap}
+h1{margin:0;font-size:26px;letter-spacing:-.02em}
+.tag{color:var(--mute);font-size:13px;margin-top:2px}
+.right{display:flex;align-items:center;gap:10px}
+.dest{color:var(--mute);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}
 
-    root.protocol("WM_DELETE_WINDOW", quit_app)
-    if sys.platform == "darwin":
-        # system Tk 8.5 can paint an empty window until a relayout happens
-        root.after(80, lambda: (root.geometry("761x681"), root.geometry("760x680"),
-                                root.lift()))
-    root.mainloop()
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:var(--shadow);padding:18px 20px;margin-bottom:14px}
+.chead{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.chead h2{margin:0;font-size:15px;font-weight:600}
+.chead .sub{color:var(--mute);font-size:12.5px}
+.step{background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:700;
+  border-radius:6px;padding:2px 7px}
+.pill{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--mute);
+  font-size:12.5px;max-width:60%;text-align:right}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+.dot.live{background:var(--good)} .dot.error{background:var(--bad)}
+.dot.busy{background:var(--accent);animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.25}}
+
+.modes{display:grid;gap:8px}
+.mode{display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:9px;
+  border:1px solid transparent;cursor:pointer;user-select:none}
+.mode:hover{background:var(--accent-soft)}
+.mode .mark{width:15px;height:15px;border-radius:50%;border:2px solid var(--faint);flex:none}
+.mode[aria-checked=true]{background:var(--accent-soft);border-color:var(--accent)}
+.mode[aria-checked=true] .mark{border-color:var(--accent);box-shadow:inset 0 0 0 3px var(--card);
+  background:var(--accent)}
+.mode .name{font-weight:550}
+.mode[aria-checked=true] .name{color:var(--accent)}
+.mode .note{color:var(--faint);font-size:12.5px}
+
+.fields{margin:14px 0 0;display:grid;gap:10px}
+.row{display:grid;grid-template-columns:120px 1fr;align-items:center;gap:12px}
+.row label{color:var(--mute);font-size:12.5px}
+input[type=text],input[type=password]{width:100%;padding:8px 11px;border-radius:8px;
+  border:1px solid var(--line);background:var(--card);color:var(--ink);font:inherit;
+  font-size:13.5px}
+input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.hint{color:var(--faint);font-size:12.5px;margin-top:12px;min-height:34px}
+.actions{display:flex;align-items:center;gap:9px;margin-top:12px;flex-wrap:wrap}
+
+.btn{border:1px solid transparent;border-radius:9px;padding:8px 16px;font:inherit;
+  font-size:13.5px;font-weight:550;cursor:pointer;background:var(--accent);
+  color:var(--accent-ink);transition:background .12s,transform .04s}
+.btn:hover{filter:brightness(1.07)} .btn:active{transform:translateY(1px)}
+.btn.ghost{background:var(--card);color:var(--ink);border-color:var(--line)}
+.btn.ghost:hover{background:var(--accent-soft)}
+.btn.ok{background:var(--good)}
+.btn[disabled]{opacity:.45;cursor:not-allowed;filter:none}
+
+.skip{display:flex;align-items:center;gap:11px;margin-bottom:12px;flex-wrap:wrap}
+.skip label{color:var(--mute);font-size:12.5px;white-space:nowrap}
+.skip input{flex:1;min-width:200px}
+.skip .tip{color:var(--faint);font-size:12px}
+
+pre.code,#log{background:var(--panel);border:1px solid var(--panel-line);border-radius:10px;
+  color:var(--panel-ink);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12.5px;margin:0;padding:13px 15px}
+pre.code{white-space:pre-wrap;word-break:break-all;max-height:190px;overflow:auto}
+#log{height:280px;overflow:auto;line-height:1.55}
+#log div{white-space:pre-wrap;word-break:break-word}
+#log .t{color:#64748b}
+#log .ok{color:#34d399} #log .warn{color:#fbbf24} #log .bad{color:#f87171}
+#log .dim{color:#8b9ab1} #log .msg{color:var(--panel-ink)}
+.foot{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
+.meta{color:var(--mute);font-size:12.5px}
+code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;padding:1px 6px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.err{background:var(--bad);color:#fff;padding:10px 14px;border-radius:9px;margin-bottom:14px}
+</style></head><body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>DropZone</h1>
+      <div class="tag">one-paste file transfer off a remote box</div>
+    </div>
+    <div class="right">
+      <span class="dest" id="dest"></span>
+      <button class="btn ghost" id="open">Open folder</button>
+      <button class="btn ghost" id="quit">Quit</button>
+    </div>
+  </header>
+
+  <div id="offline" class="err" hidden>Lost the connection to DropZone. Is it still running?</div>
+
+  <section class="card">
+    <div class="chead">
+      <h2>Connection</h2>
+      <span class="pill"><i class="dot" id="dot"></i><span id="status"></span></span>
+    </div>
+    <div class="modes" id="modes" role="radiogroup"></div>
+    <div class="fields" id="fields"></div>
+    <div class="hint" id="hint"></div>
+    <div class="actions">
+      <button class="btn" id="apply">Apply</button>
+      <button class="btn ghost" id="login">Log in to Cloudflare</button>
+      <span class="meta" id="cfnote"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="chead"><span class="step">1</span><h2>Paste this into your VPS shell</h2></div>
+    <div class="skip">
+      <label for="excl">Never send</label>
+      <input type="text" id="excl" spellcheck="false" autocomplete="off">
+      <span class="tip">space-separated patterns</span>
+    </div>
+    <pre class="code" id="snippet"></pre>
+    <div class="foot">
+      <button class="btn" id="copy">Copy command</button>
+      <span class="meta" id="listening"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="chead"><span class="step">2</span><h2>Activity</h2>
+      <span class="sub"><code class="k">peek /path</code> previews &middot;
+        <code class="k">send /path</code> copies it here</span>
+    </div>
+    <div id="log"></div>
+  </section>
+</div>
+<script>
+const K = new URLSearchParams(location.search).get('k') || sessionStorage.getItem('dzk') || '';
+if (K) sessionStorage.setItem('dzk', K);
+const $ = s => document.querySelector(s);
+let S = null;
+
+async function api(path, body){
+  const opt = {headers:{'X-UI-Token':K}};
+  if (body){ opt.method='POST'; opt.headers['Content-Type']='application/json';
+             opt.body=JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function modeCards(){
+  $('#modes').innerHTML = S.modes.map(m =>
+    `<div class="mode" role="radio" data-id="${m.id}" aria-checked="false" tabindex="0">
+       <span class="mark"></span><span class="name">${m.name}</span>
+       <span class="note">${m.note}</span></div>`).join('');
+  document.querySelectorAll('.mode').forEach(el => {
+    const pick = () => { S.mode = el.dataset.id; render(); };
+    el.onclick = pick;
+    el.onkeydown = e => { if (e.key === ' ' || e.key === 'Enter'){ e.preventDefault(); pick(); } };
+  });
+}
+
+function fields(){
+  const need = S.modes.find(m => m.id === S.mode).fields;
+  const box = $('#fields');
+  const focused = document.activeElement && document.activeElement.dataset
+                  ? document.activeElement.dataset.key : null;
+  if (box.dataset.for !== S.mode){
+    box.dataset.for = S.mode;
+    box.innerHTML = need.map(f =>
+      `<div class="row"><label for="f-${f}">${S.fieldLabels[f]}</label>
+       <input id="f-${f}" data-key="${f}" spellcheck="false" autocomplete="off"
+        type="${f === 'tunnel_token' ? 'password' : 'text'}"></div>`).join('');
+    box.querySelectorAll('input').forEach(i => {
+      i.value = S[i.dataset.key] || '';
+      i.oninput = () => { S[i.dataset.key] = i.value; };
+      i.onkeydown = e => { if (e.key === 'Enter') $('#apply').click(); };
+    });
+  } else {
+    box.querySelectorAll('input').forEach(i => {
+      if (i.dataset.key !== focused) i.value = S[i.dataset.key] || '';
+    });
+  }
+}
+
+function render(){
+  document.querySelectorAll('.mode').forEach(el =>
+    el.setAttribute('aria-checked', el.dataset.id === S.mode));
+  fields();
+  $('#hint').textContent = S.modes.find(m => m.id === S.mode).hint
+                            .replace('{port}', S.port);
+  $('#dot').className = 'dot ' + S.health;
+  $('#status').textContent = S.status;
+  $('#dest').textContent = S.dest;
+  $('#snippet').textContent = S.snippet;
+  $('#listening').textContent = 'listening on ' + S.base +
+    (S.chunk ? '   ·   split into ' + S.chunk + 'MB requests' : '');
+  if (document.activeElement !== $('#excl')) $('#excl').value = S.exclude;
+  $('#apply').disabled = S.busy;
+  $('#apply').textContent = S.busy ? 'Connecting…' : 'Apply';
+  $('#login').disabled = S.busy || S.mode !== 'domain';
+  $('#cfnote').textContent = S.cloudflared
+    ? (S.mode === 'domain' && !S.cfLoggedIn ? 'log in once to use your own domain' : '')
+    : 'cloudflared not found — ' + S.installHint;
+}
+
+function addLog(entry){
+  const line = entry.line, cls = entry.cls;
+  const box = $('#log');
+  const stuck = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const i = line.indexOf('] ');
+  const div = document.createElement('div');
+  const t = document.createElement('span');
+  t.className = 't'; t.textContent = i > 0 ? line.slice(0, i + 2) : '';
+  const m = document.createElement('span');
+  m.className = cls; m.textContent = i > 0 ? line.slice(i + 2) : line;
+  div.append(t, m); box.append(div);
+  while (box.childElementCount > 800) box.firstChild.remove();
+  if (stuck) box.scrollTop = box.scrollHeight;
+}
+
+$('#apply').onclick = () => {
+  const body = {mode:S.mode, hostname:S.hostname, tunnel_name:S.tunnel_name,
+                tunnel_token:S.tunnel_token, url:S.url};
+  S.busy = true; render();
+  api('/api/connect', body).catch(e => alert(e.message));
+};
+$('#login').onclick = () => api('/api/login', {}).catch(e => alert(e.message));
+$('#open').onclick = () => api('/api/open', {}).catch(e => alert(e.message));
+$('#quit').onclick = () => {
+  if (confirm('Stop DropZone? Transfers in progress will be cut off.'))
+    api('/api/quit', {}).catch(() => {});
+};
+
+let exclTimer = null;
+$('#excl').oninput = () => {
+  clearTimeout(exclTimer);
+  const v = $('#excl').value;
+  exclTimer = setTimeout(() => api('/api/exclude', {exclude:v}).catch(()=>{}), 350);
+};
+
+$('#copy').onclick = async () => {
+  const btn = $('#copy'), text = S ? S.snippet : '';
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.append(ta); ta.select();
+    try { document.execCommand('copy'); } finally { ta.remove(); }
+  }
+  btn.textContent = '✓  Copied!'; btn.classList.add('ok');
+  clearTimeout(btn._t);
+  btn._t = setTimeout(() => { btn.textContent = 'Copy command';
+                              btn.classList.remove('ok'); }, 1600);
+};
+
+function listen(){
+  const es = new EventSource('/api/events?k=' + encodeURIComponent(K));
+  es.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.kind === 'log') addLog(msg.data);
+    else if (msg.kind === 'state'){
+      const focused = document.activeElement;
+      const keep = focused && focused.dataset && focused.dataset.key;
+      const mine = {};
+      if (keep) mine[keep] = focused.value;
+      S = Object.assign(msg.data, mine);
+      render();
+    } else if (msg.kind === 'bye') { es.close(); $('#offline').hidden = false; }
+  };
+  es.onopen = () => { $('#offline').hidden = true; };
+  es.onerror = () => { $('#offline').hidden = false; };
+}
+
+(async function start(){
+  try { S = await api('/api/state'); }
+  catch (e) {
+    document.body.innerHTML = '<div class="wrap"><div class="err">This page needs the '
+      + 'link printed in the terminal (it carries a one-time key).</div></div>';
+    return;
+  }
+  modeCards(); render();
+  (S.log || []).forEach(addLog);
+  listen();
+})();
+</script></body></html>
+"""
+
+
+# --------------------------------------------------------------------------
+# control server - local only, this is what the browser talks to
+# --------------------------------------------------------------------------
+
+UI_TOKEN = secrets.token_urlsafe(12)
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+class Control(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "DropZone-UI/1.0"
+    app = None                      # set once, before the server starts
+
+    def log_message(self, *args):
+        pass
+
+    # -- guards ----------------------------------------------------------
+    def _local(self):
+        """Only this machine, and no cross-origin page driving the API."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in LOCAL_HOSTS:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                if urlparse(origin).hostname not in LOCAL_HOSTS:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _authed(self):
+        given = self.headers.get("X-UI-Token", "")
+        if not given:
+            given = parse_qs(urlparse(self.path).query).get("k", [""])[0]
+        return secrets.compare_digest(given, UI_TOKEN)
+
+    # -- replies ---------------------------------------------------------
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; img-src 'self' data:")
+        self.end_headers()
+        if body and self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    # -- routes ----------------------------------------------------------
+    def do_GET(self):
+        if not self._local():
+            return self._send(403, b"local requests only\n")
+        path = urlparse(self.path).path
+        if path == "/":
+            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        if not self._authed():
+            return self._send(403, b"bad or missing key\n")
+        if path == "/api/state":
+            state = self.app.as_dict()
+            state["log"] = [{"line": l, "cls": log_class(l.partition("] ")[2])}
+                            for l in LOG_HISTORY[-300:]]
+            return self._json(state)
+        if path == "/api/events":
+            return self._stream()
+        self._send(404, b"not here\n")
+
+    def do_POST(self):
+        if not self._local():
+            return self._send(403, b"local requests only\n")
+        if not self._authed():
+            return self._send(403, b"bad or missing key\n")
+        path = urlparse(self.path).path
+        try:
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.loads(raw or b"{}")
+        except Exception:
+            body = {}
+        app = self.app
+
+        if path == "/api/connect":
+            app.apply_async(**{k: body.get(k) for k in
+                               ("mode", "hostname", "tunnel_name",
+                                "tunnel_token", "url")})
+            return self._json({"ok": True})
+        if path == "/api/exclude":
+            app.set_exclude(body.get("exclude", ""))
+            return self._json({"ok": True})
+        if path == "/api/login":
+            app.login_async()
+            return self._json({"ok": True})
+        if path == "/api/open":
+            open_folder(DEST)
+            log(f"opened {tilde(DEST)}")
+            return self._json({"ok": True})
+        if path == "/api/quit":
+            self._json({"ok": True})
+            threading.Thread(target=shutdown, daemon=True).start()
+            return
+        self._send(404, b"not here\n")
+
+    # -- live log --------------------------------------------------------
+    def _stream(self):
+        q = BUS.subscribe()
+        self.close_connection = True        # SSE runs until the tab goes away
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(b": open\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    msg = q.get(timeout=15)
+                    self.wfile.write(b"data: " + msg.encode() + b"\n\n")
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")     # keep the tab attached
+                self.wfile.flush()
+        except Exception:
+            pass                                        # tab closed - that's all
+        finally:
+            BUS.unsubscribe(q)
+
+
+def shutdown():
+    BUS.publish("bye", {})
+    time.sleep(0.2)
+    log("shutting down")
+    stop_tunnel()
+    os._exit(0)
+
+
+def start_control(app, ui_port):
+    """Bind the browser UI to loopback only - the tunnel must never see it."""
+    Control.app = app
+    srv = ThreadingHTTPServer(("127.0.0.1", ui_port), Control)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
 
 
 def open_folder(path):
@@ -829,8 +1300,191 @@ def open_folder(path):
 
 
 # --------------------------------------------------------------------------
+# terminal mode
+# --------------------------------------------------------------------------
+
+ANSI = {"ok": "\033[32m", "warn": "\033[33m", "bad": "\033[31m",
+        "dim": "\033[90m", "msg": ""}
+DIM, BOLD, OFF = "\033[90m", "\033[1m", "\033[0m"
+TTY = sys.stdout.isatty()
+
+
+def paint(text, code):
+    return f"{code}{text}{OFF}" if TTY and code else text
+
+
+def term_sink(line):
+    stamp, _, msg = line.partition("] ")
+    if not msg:
+        print(line)
+        return
+    print(paint(stamp + "]", DIM) + " " + paint(msg, ANSI[log_class(msg)]))
+
+
+def copy_to_clipboard(text):
+    if sys.platform == "darwin":
+        tries = [["pbcopy"]]
+    elif os.name == "nt":
+        tries = [["clip"]]
+    else:
+        tries = [["wl-copy"], ["xclip", "-selection", "clipboard"],
+                 ["xsel", "--clipboard", "--input"]]
+    for cmd in tries:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode(), check=True)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+HELP = """
+  commands
+
+    show                  print the paste-me command again
+    copy                  copy it to the clipboard
+    status                where files land, what is listening, what is skipped
+    log [n]               replay the last n log lines (default 20)
+
+    mode <name>           %s
+    hostname <host>       domain for `mode domain` / `mode token`
+    name <name>           cloudflared tunnel name (default dropzone)
+    token <token>         tunnel token for `mode token`
+    url <base-url>        base URL for `mode url`
+    exclude <patterns>    what `send` never uploads ('exclude -' clears it)
+    apply                 bring the chosen mode up and reprint the command
+    login                 authorise cloudflared for `mode domain`
+
+    dest [path]           show or change where files land
+    open                  open that folder in the file manager
+    quit                  stop DropZone
+""" % " | ".join(MODE_IDS)
+
+
+def banner(app):
+    out = ["", paint("  DropZone", BOLD)]
+    out.append(f"  saving to   {tilde(DEST)}")
+    out.append(f"  listening   {app.base}")
+    if app.chunk:
+        out.append(f"  splitting   {app.chunk}MB per request (proxy body limit)")
+    out.append(f"  skipping    {app.exclude or '(nothing)'}")
+    out.append("")
+    out.append("  1. paste this into your VPS shell:")
+    out.append("")
+    out.append("     " + app.snippet())
+    out.append("")
+    out.append("  2. then:  " + paint("peek /path", BOLD) + "  to preview,  "
+               + paint("send /path", BOLD) + "  to copy it here")
+    out.append("")
+    out.append(paint("  type `help` for commands, `quit` to stop", DIM))
+    out.append("")
+    return "\n".join(out)
+
+
+def repl(app):
+    """--headless: everything the browser UI does, driven from the prompt."""
+    print(banner(app))
+    prompt = paint("dz>", BOLD) + " "
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not raw:
+            continue
+        cmd, _, rest = raw.partition(" ")
+        cmd, rest = cmd.lower(), rest.strip()
+
+        if cmd in ("help", "h", "?"):
+            print(HELP)
+        elif cmd in ("quit", "exit", "q"):
+            break
+        elif cmd == "show":
+            print("\n     " + app.snippet() + "\n")
+        elif cmd in ("copy", "c"):
+            if copy_to_clipboard(app.snippet()):
+                print("  copied to the clipboard")
+            else:
+                print("  no clipboard tool found - here it is:\n")
+                print("     " + app.snippet() + "\n")
+        elif cmd in ("status", "st"):
+            print(f"  mode        {mode_info(app.mode)['name']}")
+            print(f"  listening   {app.base}   ({app.status})")
+            print(f"  saving to   {tilde(DEST)}")
+            print(f"  splitting   {str(app.chunk) + 'MB per request' if app.chunk else 'off'}")
+            print(f"  skipping    {app.exclude or '(nothing)'}")
+        elif cmd == "log":
+            n = int(rest) if rest.isdigit() else 20
+            for line in LOG_HISTORY[-n:]:
+                term_sink(line)
+        elif cmd == "mode":
+            if rest in MODE_IDS:
+                app.update(mode=rest)
+                need = mode_info(rest)["fields"]
+                print(f"  mode set to {mode_info(rest)['name']}")
+                print(f"  {mode_info(rest)['hint'].replace('{port}', str(app.port))}")
+                if need:
+                    print("  needs: " + ", ".join(FIELD_LABELS[f].lower() for f in need))
+                print("  run `apply` to bring it up")
+            else:
+                print("  pick one of: " + " | ".join(MODE_IDS))
+        elif cmd in ("hostname", "host"):
+            app.update(hostname=rest)
+            print(f"  hostname = {app.hostname or '(none)'}")
+        elif cmd == "name":
+            app.update(tunnel_name=rest)
+            print(f"  tunnel name = {app.tunnel_name}")
+        elif cmd == "token":
+            app.update(tunnel_token=rest)
+            print(f"  tunnel token = {'set' if app.tunnel_token else '(none)'}")
+        elif cmd == "url":
+            app.update(url=rest)
+            print(f"  base url = {app.url or '(none)'}")
+        elif cmd in ("exclude", "skip"):
+            app.set_exclude("" if rest == "-" else rest)
+            print(f"  skipping {app.exclude or '(nothing)'}")
+            print("\n     " + app.snippet() + "\n")
+        elif cmd in ("apply", "go", "connect"):
+            ok, msg = app.apply()
+            print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
+            print("\n     " + app.snippet() + "\n")
+        elif cmd == "login":
+            done = threading.Event()
+
+            def finished(ok, msg):
+                print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
+                done.set()
+            cf_login(finished)
+            print("  a browser window should open - waiting ...")
+            done.wait()
+        elif cmd == "dest":
+            if rest:
+                set_dest(Path(rest).expanduser())
+                app.push()
+            print(f"  saving to {tilde(DEST)}")
+        elif cmd == "open":
+            open_folder(DEST)
+            print(f"  opened {tilde(DEST)}")
+        else:
+            print(f"  no such command: {cmd}   (try `help`)")
+
+    print("  stopping ...")
+    stop_tunnel()
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
+
+def set_dest(path):
+    global DEST
+    DEST = path
+    DEST.mkdir(parents=True, exist_ok=True)
+    log(f"saving to {tilde(DEST)}")
+
 
 def main():
     global DEST, AUTO_EXTRACT
@@ -838,7 +1492,7 @@ def main():
     ap = argparse.ArgumentParser(description="Receive files from a remote box.")
     cfg = load_config()
 
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=8765, help="upload listen port")
     ap.add_argument("--dest", default=str(DEST), help="where received files land")
     ap.add_argument("--tunnel", choices=["auto", "quick", "domain", "token", "off"],
                     default="auto",
@@ -857,17 +1511,27 @@ def main():
                     help="space-separated patterns `send` never uploads "
                          f"(default: {DEFAULT_EXCLUDE!r}; '' sends everything)")
     ap.add_argument("--no-extract", action="store_true", help="keep .tgz archives as-is")
-    ap.add_argument("--headless", action="store_true", help="no GUI")
+    ap.add_argument("--headless", action="store_true",
+                    help="drive everything from this terminal, no browser UI")
+    ap.add_argument("--ui-port", type=int, default=0,
+                    help="port for the local browser UI (default: pick a free one)")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="start the browser UI but do not open a window")
     args = ap.parse_args()
 
     DEST = Path(args.dest).expanduser()
     AUTO_EXTRACT = not args.no_extract
     DEST.mkdir(parents=True, exist_ok=True)
 
-    if args.headless:
-        LOG_SINKS.append(print)
+    LOG_SINKS.append(term_sink)
+    LOG_SINKS.append(lambda line: BUS.publish(
+        "log", {"line": line, "cls": log_class(line.partition("] ")[2])}))
 
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Receiver)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", args.port), Receiver)
+    except OSError as e:
+        sys.exit(f"cannot listen on port {args.port}: {e}\n"
+                 f"another DropZone may already be running - try --port {args.port + 1}")
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -880,55 +1544,48 @@ def main():
     else:
         mode = args.tunnel
 
-    note = ""
-    try:
-        base = connect(args.port, mode, args.hostname, args.tunnel_name,
-                       args.tunnel_token, args.url)
-    except TunnelError as e:
-        note = f"no tunnel ({e}) - showing this machine's local address instead"
-        log(note)
-        log("that address only works from this network; fix the above for a public URL")
-        mode, base = "direct", f"http://{lan_ip()}:{args.port}"
+    app = App(args.port, {**cfg, "mode": mode, "hostname": args.hostname,
+                          "tunnel_name": args.tunnel_name,
+                          "tunnel_token": args.tunnel_token,
+                          "url": args.url or "", "exclude": args.exclude},
+              args.chunk_mb)
 
-    chunk = chunk_for(mode, base, args.chunk_mb)
+    log(f"saving to {tilde(DEST)}")
+    app.apply()
 
-    if args.headless or not gui_available():
-        if not args.headless:
-            LOG_SINKS.append(print)
-        print(f"\n  saving to  {DEST}")
-        print(f"  listening  {base}")
-        if chunk:
-            print(f"  splitting  {chunk}MB per request (proxy body limit)")
-        if args.exclude.strip():
-            print(f"  skipping   {args.exclude.strip()}")
-        print()
-        print("  1. paste into the VPS shell:\n")
-        print("     " + snippet(base, chunk, args.exclude) + "\n")
-        print("  2. preview:  peek /path/to/file-or-folder")
-        print("     send it:  send /path/to/file-or-folder\n")
-        print("  ctrl-c to stop\n")
+    if args.headless:
+        if sys.stdin.isatty():
+            repl(app)
+        else:
+            # piped or nohup'd: there is nobody to prompt, so just keep running
+            print(banner(app))
+            print("  no terminal attached - running until stopped\n")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                stop_tunnel()
+        return
+
+    ui_port = start_control(app, args.ui_port)
+    ui_url = f"http://127.0.0.1:{ui_port}/?k={UI_TOKEN}"
+    print()
+    print(paint("  DropZone", BOLD) + f"  -  control panel at {ui_url}")
+    print(f"  saving to   {tilde(DEST)}")
+    print(f"  listening   {app.base}")
+    print(paint("  ctrl-c here, or Quit in the browser, to stop", DIM))
+    print()
+    if not args.no_browser:
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            stop_tunnel()
-    else:
-        run_gui(base, chunk, args.port, {**cfg, "mode": mode,
-                                         "hostname": args.hostname,
-                                         "tunnel_name": args.tunnel_name,
-                                         "tunnel_token": args.tunnel_token,
-                                         "exclude": args.exclude},
-                args.chunk_mb, note)
-
-
-def gui_available():
+            webbrowser.open(ui_url)
+        except Exception as e:
+            log(f"could not open a browser ({e}) - use the link above")
     try:
-        import tkinter  # noqa
-        if os.name != "nt" and sys.platform != "darwin" and not os.environ.get("DISPLAY"):
-            return False
-        return True
-    except Exception:
-        return False
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+        stop_tunnel()
 
 
 if __name__ == "__main__":

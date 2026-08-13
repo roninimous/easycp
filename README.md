@@ -38,7 +38,9 @@ mainstream distro already has.
 python3 dropzone.py
 ```
 
-A window opens with a command in it.
+A control panel opens in your browser with a command in it. Prefer the
+terminal? `python3 dropzone.py --headless` gives you the same controls at a
+prompt — no browser, no GUI toolkit, works over SSH.
 
 1. **Copy the command** and paste it into your VPS shell. Nothing prints — it
    defines two shell functions, which is all it should do.
@@ -49,12 +51,50 @@ peek /var/www/html      # lists what would go, uploads nothing
 send /var/www/html      # actually transfers it
 ```
 
-Files arrive in `~/DropZone`, with progress in the log pane. `send` takes
-several paths at once: `send /etc/nginx/nginx.conf /var/log/app.log`.
+Files arrive in `~/DropZone`, and every file that lands is named in the
+activity log. `send` takes several paths at once:
+`send /etc/nginx/nginx.conf /var/log/app.log`.
+
+## The two front ends
+
+There is no GUI toolkit anywhere — no Tk, no Qt, nothing to install.
+
+**Browser control panel** (default). DropZone serves a small page on
+`127.0.0.1` and opens it. The page is bound to loopback only, so the tunnel
+never exposes it, and every request carries a one-time key printed with the
+URL. It streams the activity log live over server-sent events.
+
+**Terminal** (`--headless`). Same engine, driven from a prompt. `help` lists
+everything:
+
+```
+show                  print the paste-me command again
+copy                  copy it to the clipboard
+status                where files land, what is listening, what is skipped
+log [n]               replay the last n log lines
+
+mode <name>           quick | domain | token | direct | url
+hostname <host>       domain for `mode domain` / `mode token`
+name <name>           cloudflared tunnel name
+token <token>         tunnel token for `mode token`
+url <base-url>        base URL for `mode url`
+exclude <patterns>    what `send` never uploads ('exclude -' clears it)
+apply                 bring the chosen mode up and reprint the command
+login                 authorise cloudflared for `mode domain`
+
+dest [path]           show or change where files land
+open                  open that folder in the file manager
+quit                  stop DropZone
+```
+
+Log lines stream into the terminal while you sit at the prompt. With no
+terminal attached (`nohup`, systemd, a pipe) `--headless` prints the command
+and just keeps running.
 
 ## Connection modes
 
-Pick one in the **Connection** panel; the pasted command regenerates to match.
+Pick one in the **Connection** card, or `mode <name>` then `apply` at the
+prompt. The pasted command regenerates to match.
 
 | Mode | URL you get | Needs |
 |---|---|---|
@@ -64,8 +104,8 @@ Pick one in the **Connection** panel; the pasted command regenerates to match.
 | **Direct / LAN** | `http://192.168.x.x:8765` | same network or Tailscale |
 | **Custom URL** | whatever you already run | your own proxy |
 
-**My domain** logs in once (`Log in to Cloudflare`), then creates the tunnel and
-the DNS record for you. Settings persist to `~/.dropzone.json`.
+**My domain** logs in once (`Log in to Cloudflare`, or `login`), then creates
+the tunnel and the DNS record for you. Settings persist to `~/.dropzone.json`.
 
 Direct/LAN is not reachable from a VPS on the internet — it is for machines on
 your own network, and it skips Cloudflare's 100MB request cap entirely.
@@ -77,7 +117,8 @@ everything. Symlinks are stored as links, so their targets are not followed.
 
 Because web roots routinely contain credentials, `.git`, `node_modules` and
 `.env` are skipped by default. Edit the **Never send** field (the command
-updates as you type) or pass `--exclude`. Override per call on the remote box:
+updates as you type), run `exclude .git .env` at the prompt, or pass
+`--exclude`. Override per call on the remote box:
 
 ```bash
 DZ_EXCLUDE=".git" send /var/www/html    # keep .env this time
@@ -102,7 +143,9 @@ python3 dropzone.py [options]
   --exclude "A B C"     patterns send never uploads ('' sends everything)
   --chunk-mb N          split uploads into N-MB requests (auto = 90 behind Cloudflare)
   --no-extract          keep .tgz archives instead of unpacking
-  --headless            no GUI, print the command instead
+  --headless            drive everything from the terminal, no browser UI
+  --ui-port PORT        port for the local control panel (default: a free one)
+  --no-browser          serve the control panel but do not open a window
 ```
 
 ```bash
@@ -135,6 +178,9 @@ them under `.parts/` and concatenates once every part has arrived.
   token. Close DropZone when you are done.
 - Incoming filenames are stripped to a bare basename, so a hostile name cannot
   escape the destination folder.
+- The control panel listens on `127.0.0.1` only and rejects requests whose
+  `Host` or `Origin` is not loopback, so a web page you visit cannot drive it.
+  Its key is regenerated every launch, like the upload token.
 
 ## Known rough edges
 
@@ -142,9 +188,7 @@ them under `.parts/` and concatenates once every part has arrived.
   `sudo su` needs a fresh paste — or append the snippet to `~/.bashrc`.
 - A long transfer dies with its SSH session. Use `tmux` for big ones.
 - Killing DropZone with `SIGTERM` (e.g. `pkill`) orphans its `cloudflared`
-  child; the GUI close button and Ctrl-C shut it down properly.
-- macOS ships a deprecated Tk 8.5 that renders `ttk` widgets as an empty
-  window, so the GUI deliberately uses classic Tk widgets only.
+  child; Ctrl-C, `quit`, and the panel's Quit button shut it down properly.
 
 ## License
 
