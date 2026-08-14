@@ -126,7 +126,8 @@ send src ../notes.md
 
 The long forms are `send -all`, `send -allfiles` and
 `send -alldirectories`. For recursive matching, use `send -recursive`.
-They also work with `peek`.
+They also work with `peek`. Forgot the flags? `send -h` (or `-help`,
+`--help`) prints this same summary from the VPS shell.
 
 Wildcards still work for suffix-style selections such as `send *.png`,
 `send *.pdf` or `send *LOGO.png`. If your shell leaves that pattern literal,
@@ -246,6 +247,28 @@ follows the viewer's system theme, and dark lettering on a transparent
 background disappears in dark mode. SVG is deliberately not accepted: it is
 markup rather than an image, and nothing here needs it.
 
+### Share a file or folder
+
+Sometimes it runs the other way — you want to hand someone a single file
+without opening up the whole `send` pipeline. **Choose file** (or **Choose
+folder**) under Share uploads it to easycp and hands back a link; a folder
+goes out as a `.tar.gz`. Open the link once and the download starts; open it
+again and it 404s — the link is good for exactly one download, and easycp
+logs it the moment that happens.
+
+Same thing at the `--headless` prompt: `share <path>` works on anything
+already on disk, file or folder, no upload needed since it's local already.
+
+Sent it to the wrong person, or just want a clean link? **Regenerate link**
+in the panel (or running `share <path>` again at the same path) swaps in a
+fresh link for the same file and kills the old one on the spot - no
+re-upload, and no second copy of a tarred folder. It only works while the
+old link is still unopened; once someone has downloaded through it, that
+file is spent and sharing it again starts over.
+
+The link carries its own one-time key, not the EasyDrop upload key, so
+handing it out doesn't give anyone the ability to upload here.
+
 ## The two front ends
 
 There is no GUI toolkit anywhere — no Tk, no Qt, nothing to install.
@@ -262,7 +285,8 @@ logo, the paste-me command, the EasyDrop link, and a colour-coded live log"
 width="820">
 
 *Everything the panel does, at a prompt — the log streams in colour while you
-type.* `help` lists the commands:
+type.* The Up/Down arrows step back through what you've typed this session,
+same as any shell. `help` lists the commands:
 
 ```
 show                  print the paste-me command again
@@ -285,6 +309,9 @@ login                 authorise cloudflared for `mode domain`
 
 dest [path]           show or change where files land
 open                  open that folder in the file manager
+logo [path]           show, set, or `logo remove` the drop-page logo
+share <path>          one-time download link to a file or folder
+                      (again on the same path rotates it - old link dies)
 quit                  stop easycp
 ```
 

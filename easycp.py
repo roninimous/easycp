@@ -39,8 +39,10 @@ Both front ends can do the same thing without any flags.
 """
 
 import argparse
+import atexit
 import base64
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -51,6 +53,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import webbrowser
@@ -642,6 +645,124 @@ def clear_logo():
     log("logo removed")
 
 
+# --------------------------------------------------------------------------
+# sharing - hand out a one-time link to a single file (a folder goes out as
+# a .tar.gz, same as `peek -r`/`send -r` package one for the VPS snippet)
+# --------------------------------------------------------------------------
+
+SHARE_DIR = Path(tempfile.mkdtemp(prefix="easycp-share-"))
+atexit.register(shutil.rmtree, SHARE_DIR, ignore_errors=True)
+
+SHARES_LOCK = threading.Lock()
+SHARES = {}              # id -> {path, name, ctype, token, cleanup}
+SHARE_BATCHES_LOCK = threading.Lock()
+SHARE_BATCHES = {}       # id -> {dir, root}  (a folder mid-upload from the panel)
+
+
+def make_share(path, cleanup):
+    """Register path for one download. Returns (id, token) for the link."""
+    sid = secrets.token_hex(8)
+    token = secrets.token_urlsafe(16)
+    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    with SHARES_LOCK:
+        SHARES[sid] = {"path": path, "name": path.name, "ctype": ctype,
+                       "token": token, "cleanup": cleanup}
+    return sid, token
+
+
+def take_share(sid, key):
+    """Redeem a link: valid once, then gone even if the download fails."""
+    with SHARES_LOCK:
+        share = SHARES.get(sid)
+        if not share or not secrets.compare_digest(key, share["token"]):
+            return None
+        return SHARES.pop(sid)
+
+
+def regen_share(sid):
+    """Rotate a still-live share onto a new id/token. The old link dies the
+    instant this runs; the file underneath, and its name, do not change.
+
+    Returns (new_id, share) for the fresh link, or None if `sid` was already
+    downloaded, revoked, or never existed - regenerating only makes sense
+    for a link nobody has used yet.
+    """
+    with SHARES_LOCK:
+        share = SHARES.pop(sid, None)
+        if not share:
+            return None
+        new_sid = secrets.token_hex(8)
+        share["token"] = secrets.token_urlsafe(16)
+        SHARES[new_sid] = share
+        return new_sid, share
+
+
+def tar_folder(path):
+    archive = SHARE_DIR / f"{safe_segment(path.name) or 'folder'}-{secrets.token_hex(4)}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(path, arcname=path.name or "folder")
+    return archive
+
+
+def stage_share(path):
+    """A plain file shares as itself; a folder is tarred into SHARE_DIR first.
+
+    Returns (serveable_path, cleanup) - cleanup marks a path that is our own
+    copy, safe to delete once the link is used or the process exits.
+    """
+    if path.is_dir():
+        return tar_folder(path), True
+    return path, False
+
+
+def open_share_batch(root_name):
+    bid = secrets.token_hex(8)
+    bdir = SHARE_DIR / f".batch-{bid}"
+    root = bdir / (safe_segment(root_name or "") or "folder")
+    root.mkdir(parents=True, exist_ok=True)
+    with SHARE_BATCHES_LOCK:
+        SHARE_BATCHES[bid] = {"dir": bdir, "root": root}
+    return bid, root
+
+
+def close_share_batch(bid):
+    with SHARE_BATCHES_LOCK:
+        return SHARE_BATCHES.pop(bid, None)
+
+
+# headless only: the most recent live share id for each path, so `share
+# <path>` a second time rotates that link instead of stacking another one
+LAST_SHARE = {}
+
+
+def share_command(app, path_arg):
+    """Implements the `share <path>` prompt command. Returns lines to print."""
+    p = Path(path_arg).expanduser()
+    if not p.exists():
+        return [f"  no such file or folder: {p}"]
+    key = str(p.resolve())
+    prev = LAST_SHARE.get(key)
+    regen = regen_share(prev) if prev else None
+    if regen:
+        sid, share = regen
+        token, name = share["token"], share["name"]
+        log(f"share re-linked: {name} - the old link is dead")
+        tail = "the previous link for this is now dead"
+    else:
+        try:
+            served, cleanup = stage_share(p)
+        except Exception as e:
+            return [f"  could not prepare that: {e}"]
+        sid, token = make_share(served, cleanup)
+        name = served.name
+        what = "folder, tarred" if p.is_dir() else human(served.stat().st_size)
+        log(f"share ready: {name}  ({what})")
+        tail = "one download and it's gone"
+    LAST_SHARE[key] = sid
+    url = f"{app.base}/s/{sid}?k={token}"
+    return [f"\n     {url}\n", f"     {tail}\n"]
+
+
 OLD_DEST = Path.home() / "DropZone"
 
 
@@ -1129,7 +1250,46 @@ class Receiver(BaseHTTPRequestHandler):
             return self._json({"chunkMb": DROP_CHUNK_MB[0],
                                "dest": DEST.name,
                                "logo": bool(LOGO["data"]), "logoV": LOGO["v"]})
+        if parsed.path.startswith("/s/"):
+            # a share link carries its own one-time token - not the drop key
+            sid = parsed.path[len("/s/"):].strip("/")
+            key = parse_qs(parsed.query).get("k", [""])[0]
+            share = take_share(sid, key)
+            if not share:
+                return self._reply(404, b"this link is used up, or never existed\n")
+            return self._serve_share(share)
         self._reply(200, b"easycp is listening.\n")
+
+    def _serve_share(self, share):
+        path, name, cleanup = share["path"], share["name"], share["cleanup"]
+        try:
+            size = path.stat().st_size
+        except OSError:
+            log(f"share failed: {name} is gone from disk")
+            return self._reply(404, b"that file is gone\n")
+        self.send_response(200)
+        self.send_header("Content-Type", share["ctype"])
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{name.replace(chr(34), chr(39))}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        sent = 0
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(262144)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+            log(f"share downloaded: {name}  {human(sent)} - link is now dead")
+        except Exception as e:
+            log(f"share interrupted: {name}  ({human(sent)} sent, {e}) - link is now dead")
+        finally:
+            if cleanup:
+                path.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -1478,8 +1638,25 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
               f'"{base_url}/u/$1.tgz.p$(printf %03d $i)" || break; '
               'i=$((i+1)); done; rm -rf "$w"; }; ')
 
+    # kept as one string so it reads top-to-bottom in the source even though
+    # it lands in the middle of send()'s one-liner
+    send_help = (
+        'echo "send - copy files to this machine over the tunnel"; echo; '
+        'echo "  send [path...]         one archive per path (a file or a whole folder)"; '
+        'echo "  send                   (no args) sends the current directory"; '
+        'echo "  send -a  [path]        top-level files and folders, loose (-all)"; '
+        'echo "  send -af [path]        top-level files only (-allfiles)"; '
+        'echo "  send -ad [path]        top-level folders only (-alldirectories)"; '
+        'echo "  send -r PATTERN [dir]  files matching PATTERN anywhere under dir (-recursive)"; '
+        'echo; '
+        'echo "  send *.png             wildcards work; for \'everything\' use -a, not send *"; '
+        'echo "  DZ_EXCLUDE=\'\' send ...     ignore the default skip list for this call only"; '
+        'echo "  peek takes the same flags and previews instead of uploading"; '
+    )
+
     send = (
-        'send() { case "$1" in -r|-recursive) _dzrp "$@" || return 1; '
+        'send() { case "$1" in -h|-help|--help) ' + send_help + 'return;; '
+        '-r|-recursive) _dzrp "$@" || return 1; '
         + (flag_tar % "-") + ' | _dzup "$b"; rm -f "$l"; return; esac; '
         'k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
         (flag_tar % "-") + ' | _dzup "$b"; rm -f "$l"; return; fi; '
@@ -1947,6 +2124,25 @@ input[type=file]{display:none}
   </section>
 
   <section class="card">
+    <div class="chead"><h2>Share a file or folder</h2>
+      <span class="sub">a one-time link &mdash; it dies the moment it's opened</span>
+    </div>
+    <div class="brandbtns">
+      <button class="btn ghost" id="sharePick">Choose file</button>
+      <button class="btn ghost" id="shareFolderPick">Choose folder</button>
+    </div>
+    <input type="file" id="shareIn">
+    <input type="file" id="shareFolderIn" webkitdirectory multiple>
+    <div class="meta" id="shareNote"></div>
+    <pre class="code" id="shareLink" hidden></pre>
+    <div class="foot" id="shareFoot" hidden>
+      <button class="btn ghost" id="shareCopy">Copy link</button>
+      <button class="btn ghost" id="shareRegen">Regenerate link</button>
+      <span class="meta">Good for one download, then it's gone.</span>
+    </div>
+  </section>
+
+  <section class="card">
     <div class="chead"><span class="step">2</span><h2>Activity</h2>
       <span class="sub"><code class="k">peek /path</code> previews &middot;
         <code class="k">send /path</code> copies it here</span>
@@ -2149,6 +2345,70 @@ $('#copy').onclick = () =>
   copyBtn($('#copy'), S ? S.snippet : '', 'Copy command');
 $('#copylink').onclick = () =>
   copyBtn($('#copylink'), S ? S.dropUrl : '', 'Copy link');
+
+function shareNote(msg){ $('#shareNote').textContent = msg; }
+
+let shareId = null;
+function showShareLink(url, name, id, note){
+  shareId = id;
+  $('#shareLink').textContent = url;
+  $('#shareLink').hidden = false;
+  $('#shareFoot').hidden = false;
+  shareNote(note || (name + ' — ready to share'));
+}
+
+$('#sharePick').onclick = () => $('#shareIn').click();
+$('#shareIn').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  $('#shareFoot').hidden = true; $('#shareLink').hidden = true;
+  shareNote('Uploading ...');
+  try {
+    const r = await fetch('/api/share', {method:'POST',
+      headers:{'X-UI-Token':K, 'Content-Type': f.type || 'application/octet-stream',
+               'X-Share-Name': encodeURIComponent(f.name)},
+      body: f});
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok || !out.ok) throw new Error(out.error || r.statusText);
+    showShareLink(out.url, out.name, out.id);
+  } catch (err) { shareNote('Could not share that — ' + err.message); }
+};
+
+$('#shareFolderPick').onclick = () => $('#shareFolderIn').click();
+$('#shareFolderIn').onchange = async e => {
+  const files = Array.from(e.target.files);
+  e.target.value = '';
+  if (!files.length) return;
+  $('#shareFoot').hidden = true; $('#shareLink').hidden = true;
+  const root = (files[0].webkitRelativePath || files[0].name).split('/')[0];
+  shareNote(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} ...`);
+  try {
+    const begin = await api('/api/share/begin', {root});
+    for (const f of files){
+      const rel = f.webkitRelativePath || f.name;
+      const r = await fetch('/api/share/file', {method:'POST',
+        headers:{'X-UI-Token':K, 'Content-Type':'application/octet-stream',
+                 'X-Batch':begin.id, 'X-Path':encodeURIComponent(rel)},
+        body: f});
+      const out = await r.json().catch(() => ({}));
+      if (!r.ok || !out.ok) throw new Error(out.error || r.statusText);
+    }
+    const done = await api('/api/share/end', {id: begin.id});
+    showShareLink(done.url, done.name, done.id);
+  } catch (err) { shareNote('Could not share that folder — ' + err.message); }
+};
+
+$('#shareCopy').onclick = () =>
+  copyBtn($('#shareCopy'), $('#shareLink').textContent, 'Copy link');
+$('#shareRegen').onclick = async () => {
+  if (!shareId) return;
+  shareNote('Regenerating ...');
+  try {
+    const out = await api('/api/share/regen', {id: shareId});
+    showShareLink(out.url, out.name, out.id, out.name + ' — new link, the old one is dead');
+  } catch (err) { shareNote('Could not regenerate — ' + err.message); }
+};
 
 function listen(){
   const es = new EventSource('/api/events?k=' + encodeURIComponent(K));
@@ -2713,6 +2973,21 @@ class Control(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
+    def _recv_to_file(self, dest, length):
+        total = 0
+        with open(dest, "wb") as f:
+            while total < length:
+                chunk = self.rfile.read(min(262144, length - total))
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+        return total
+
+    def _share_url(self, path, cleanup):
+        sid, token = make_share(path, cleanup)
+        return sid, f"{self.app.base}/s/{sid}?k={token}", path.name
+
     # -- routes ----------------------------------------------------------
     def do_GET(self):
         if not self._local():
@@ -2749,8 +3024,8 @@ class Control(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         length = _int(self.headers.get("Content-Length"), 0)
 
-        # the logo arrives as raw image bytes, so read it before anything
-        # tries to parse the body as JSON
+        # the logo, and a shared file, arrive as a raw body - read it before
+        # anything tries to parse the request as JSON
         if path == "/api/logo":
             if length > LOGO_MAX:
                 return self._json({"ok": False,
@@ -2761,6 +3036,45 @@ class Control(BaseHTTPRequestHandler):
                 self.app.push()
             return self._json({"ok": ok, "error": None if ok else msg},
                               200 if ok else 400)
+
+        if path == "/api/share":
+            raw_name = unquote(self.headers.get("X-Share-Name", ""))
+            dest = unique_path(SHARE_DIR / safe_name(raw_name))
+            try:
+                n = self._recv_to_file(dest, length)
+            except Exception as e:
+                dest.unlink(missing_ok=True)
+                return self._json({"ok": False, "error": str(e)}, 500)
+            sid, url, name = self._share_url(dest, cleanup=True)
+            log(f"share ready: {name}  {human(n)}")
+            return self._json({"ok": True, "url": url, "name": name, "id": sid})
+
+        if path == "/api/share/file":
+            bid = self.headers.get("X-Batch", "")
+            with SHARE_BATCHES_LOCK:
+                batch = SHARE_BATCHES.get(bid)
+            if not batch:
+                self.rfile.read(length)
+                return self._json({"ok": False, "error": "unknown batch"}, 404)
+            # the browser's relative path already starts with the folder
+            # name (webkitRelativePath), same as batch["root"] does - so
+            # this joins onto batch["dir"], not batch["root"], or the name
+            # would be nested twice
+            parts = safe_rel(unquote(self.headers.get("X-Path", "")))
+            if not parts:
+                self.rfile.read(length)
+                return self._json({"ok": False, "error": "bad path"}, 400)
+            try:
+                target = under(batch["dir"], *parts)
+            except ValueError:
+                self.rfile.read(length)
+                return self._json({"ok": False, "error": "bad path"}, 400)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._recv_to_file(target, length)
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
+            return self._json({"ok": True})
 
         try:
             raw = self.rfile.read(length)
@@ -2773,6 +3087,35 @@ class Control(BaseHTTPRequestHandler):
             clear_logo()
             app.push()
             return self._json({"ok": True})
+        if path == "/api/share/begin":
+            bid, _root = open_share_batch(str(body.get("root") or ""))
+            return self._json({"ok": True, "id": bid})
+        if path == "/api/share/end":
+            batch = close_share_batch(str(body.get("id") or ""))
+            if not batch:
+                return self._json({"ok": False, "error": "unknown batch"}, 404)
+            root = batch["root"]
+            try:
+                if not any(root.iterdir()):
+                    raise ValueError("empty folder")
+                archive = tar_folder(root)
+            except Exception as e:
+                shutil.rmtree(batch["dir"], ignore_errors=True)
+                return self._json({"ok": False, "error": str(e)}, 400)
+            shutil.rmtree(batch["dir"], ignore_errors=True)
+            sid, url, name = self._share_url(archive, cleanup=True)
+            log(f"share ready: {name}")
+            return self._json({"ok": True, "url": url, "name": name, "id": sid})
+        if path == "/api/share/regen":
+            result = regen_share(str(body.get("id") or ""))
+            if not result:
+                return self._json(
+                    {"ok": False, "error": "that link is already gone"}, 404)
+            sid, share = result
+            url = f"{app.base}/s/{sid}?k={share['token']}"
+            log(f"share re-linked: {share['name']} - the old link is dead")
+            return self._json({"ok": True, "url": url, "name": share["name"],
+                               "id": sid})
         if path == "/api/connect":
             app.apply_async(**{k: body.get(k) for k in
                                ("mode", "hostname", "tunnel_name",
@@ -2887,6 +3230,12 @@ def enable_ansi():
 COLOUR = enable_ansi()
 TTY = sys.stdout.isatty() and COLOUR
 
+try:
+    import readline          # noqa: F401 - up/down history at the `--headless` prompt
+    readline.set_history_length(500)
+except ImportError:
+    pass                      # Windows: the console already recalls history with the arrows
+
 
 def paint(text, code):
     return f"{code}{text}{OFF}" if TTY and code else text
@@ -2949,6 +3298,8 @@ HELP = """
     dest [path]           show or change where files land
     open                  open that folder in the file manager
     logo [path]           show, set, or `logo remove` the drop-page logo
+    share <path>          one-time download link to a file or folder
+                          (again on the same path rotates it - old link dies)
     quit                  stop easycp
 """ % " | ".join(MODE_IDS)
 
@@ -3151,6 +3502,12 @@ def repl(app):
             else:
                 print(f"  logo: {'set' if LOGO['data'] else '(none)'}"
                       "   usage: logo <path>  |  logo remove")
+        elif cmd == "share":
+            if not rest:
+                print("  usage: share <path>  (again on the same path rotates the link)")
+            else:
+                for line in share_command(app, unescape_path(rest)):
+                    print(line)
         else:
             print(f"  no such command: {cmd}   (try `help`)")
 
