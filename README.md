@@ -39,12 +39,53 @@ command, and watch files land.*
 
 ## Requirements
 
-- Python 3.8+ (uses only the standard library)
-- `cloudflared` — optional, only for a public URL:
-  `brew install cloudflared`
+Python 3.8+ on the receiving machine — standard library only, nothing to `pip
+install`.
 
-The remote box needs nothing but `tar`, `curl` and `split`, which every
-mainstream distro already has.
+`cloudflared` is **optional**. You need it only for a public URL; **Direct /
+LAN** mode works without it.
+
+**macOS**
+
+```bash
+brew install cloudflared
+```
+
+**Windows**
+
+```powershell
+winget install --id Cloudflare.cloudflared
+```
+
+The winget build sometimes lags behind; for the current release take
+`cloudflared-windows-amd64.msi` from the [releases page][rel]. Note that
+cloudflared does **not** self-update on Windows.
+
+**Linux** — Debian/Ubuntu, via Cloudflare's own apt repository:
+
+```bash
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+  | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+  | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
+```
+
+On RPM distros install `cloudflared-linux-x86_64.rpm` from the same
+[releases page][rel]. Anywhere else, drop the static binary in place:
+
+```bash
+sudo curl -fsSL -o /usr/local/bin/cloudflared \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+sudo chmod +x /usr/local/bin/cloudflared
+```
+
+Swap `amd64` for `arm64` on a Raspberry Pi or other ARM box.
+
+[rel]: https://github.com/cloudflare/cloudflared/releases/latest
+
+The remote box you are pulling *from* needs nothing but `tar`, `curl` and
+`split`, which every mainstream distro already has.
 
 ## Quick start
 

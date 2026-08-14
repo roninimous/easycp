@@ -637,8 +637,11 @@ def lan_ip():
 INSTALL_HINT = {
     "darwin": "brew install cloudflared",
     "win32": "winget install --id Cloudflare.cloudflared",
-}.get(sys.platform, "see https://developers.cloudflare.com/cloudflare-one/"
-                    "connections/connect-networks/downloads/")
+}.get(sys.platform,
+      # everything else is some Linux/BSD: the apt/yum repo covers most of it,
+      # and the static binary covers the rest
+      "apt/yum repo at https://pkg.cloudflare.com, or a binary from "
+      "https://github.com/cloudflare/cloudflared/releases")
 
 
 class TunnelError(Exception):
