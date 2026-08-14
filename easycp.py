@@ -1366,6 +1366,9 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
     #
     # _dzm expands a wildcard argument if the user's shell left it literal
     # (for example under noglob). Normal shell expansion still wins first.
+    #
+    # _dzrp builds a recursive file list for `send -r PATTERN [ROOT]`, keeping
+    # paths relative to ROOT so extraction recreates just the matching tree.
     prelude = (
         f'DZ_EXCLUDE="${{DZ_EXCLUDE-{excludes}}}"; '
         '_dzx() { for x in $(printf "%s\\n" "$DZ_EXCLUDE"); do '
@@ -1391,6 +1394,15 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
         '[ -e "$e" ] || continue; '
         'case "$k" in f) [ -f "$e" ] || continue;; d) [ -d "$e" ] || continue;; '
         'esac; printf "%s\\n" "$e"; done ); }; '
+        '_dzrp() { [ -n "$2" ] || { echo "missing pattern for $1"; return 1; }; '
+        'p=$2; q=$(_dzr "${3:-.}"); '
+        'if [ -z "$q" ]; then echo "no such path: ${3:-.}"; return 1; fi; '
+        'if [ "$q" = / ]; then echo "refusing to take the whole filesystem"; '
+        'return 1; fi; b=$(basename "$q"); l=$(mktemp); '
+        '( cd "$q" || exit 1; find . -type f -name "$p" -print ) | '
+        'sed "s#^./##" > "$l"; '
+        'if [ ! -s "$l" ]; then rm -f "$l"; '
+        'echo "nothing matching $p in $q"; return 1; fi; }; '
         # every flag resolves to a kind, so peek and send parse them the same way
         '_dzk() { case "$1" in -a|-all) echo all;; -af|-allfiles) echo f;; '
         '-ad|-alldirs|-alldirectories) echo d;; esac; }; '
@@ -1418,7 +1430,13 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
     )
 
     peek = (
-        'peek() { k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
+        'peek() { case "$1" in -r|-recursive) _dzrp "$@" || return 1; '
+        't=$(mktemp); ' + (flag_tar % '"$t"') + '; '
+        'echo "== $q"; tar -tzf "$t" | sed "s/^/   /" | head -30; '
+        'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
+        '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
+        'rm -f "$t" "$l"; return; esac; '
+        'k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
         't=$(mktemp); ' + (flag_tar % '"$t"') + '; '
         'echo "== $q"; tar -tzf "$t" | sed "s/^/   /" | head -30; '
         'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
@@ -1446,7 +1464,9 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
               'i=$((i+1)); done; rm -rf "$w"; }; ')
 
     send = (
-        'send() { k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
+        'send() { case "$1" in -r|-recursive) _dzrp "$@" || return 1; '
+        + (flag_tar % "-") + ' | _dzup "$b"; rm -f "$l"; return; esac; '
+        'k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
         (flag_tar % "-") + ' | _dzup "$b"; rm -f "$l"; return; fi; '
         'for p in "${@:-.}"; do m=$(_dzm "$p"); '
         'if [ -z "$m" ]; then echo "no such path: $p"; continue; fi; '

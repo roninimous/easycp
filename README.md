@@ -120,16 +120,30 @@ send            # sends all of it, keeping the directory's own name
 send -a         # sends all top-level files and directories loose
 send -af        # sends only top-level files
 send -ad        # sends only top-level directories
+send -r '*LOGO.png'  # sends matching files anywhere under here
 send src ../notes.md
 ```
 
 The long forms are `send -all`, `send -allfiles` and
-`send -alldirectories`. They also work with `peek`.
+`send -alldirectories`. For recursive matching, use `send -recursive`.
+They also work with `peek`.
 
 Wildcards still work for suffix-style selections such as `send *.png`,
 `send *.pdf` or `send *LOGO.png`. If your shell leaves that pattern literal,
 `send` expands it against the current directory. Do not use `send *` as the
 "everything" form; use `send -a` instead.
+
+For recursive suffix matching, quote the pattern so the shell does not expand
+it too early:
+
+```bash
+send -r '*LOGO.png'
+send -recursive '*.pdf'
+```
+
+That searches from the current directory down and uploads one archive named
+after the current directory. Inside it, only matching files are included, with
+their relative folder paths preserved.
 
 `send -a` and `send .` are not the same thing:
 
