@@ -97,8 +97,11 @@ A control panel opens in your browser with a command in it. Prefer the
 terminal? `python3 easycp.py --headless` gives you the same controls at a
 prompt — no browser, no GUI toolkit, works over SSH.
 
-1. **Copy the command** and paste it into your VPS shell. Nothing prints — it
-   defines two shell functions, which is all it should do.
+1. **Copy the command** and paste it into your VPS shell. It defines two
+   shell functions, clears the pasted one-liner off the screen, and shows
+   the easycp banner and a note: `peek` and `send` are set up in this
+   shell, and gone the moment it closes - nothing is installed or left
+   behind.
 2. **Preview**, then send:
 
 ```bash
@@ -126,8 +129,13 @@ send src ../notes.md
 
 The long forms are `send -all`, `send -allfiles` and
 `send -alldirectories`. For recursive matching, use `send -recursive`.
-They also work with `peek`. Forgot the flags? `send -h` (or `-help`,
-`--help`) prints this same summary from the VPS shell.
+They also work with `peek`. Forgot the flags? `send -h` and `peek -h`
+(or `-help`, `--help`) print a summary from the VPS shell.
+
+`peek` only lists names by default — no size, since getting one means
+compressing everything first, and that's what makes a peek on a big folder
+slow. Put `-s` (or `-size`) first to get it anyway: `peek -s /var/www/html`,
+`peek -s -a`, `peek -s -r '*.log'`.
 
 Wildcards still work for suffix-style selections such as `send *.png`,
 `send *.pdf` or `send *LOGO.png`. If your shell leaves that pattern literal,
@@ -289,7 +297,7 @@ type.* The Up/Down arrows step back through what you've typed this session,
 same as any shell. `help` lists the commands:
 
 ```
-show                  print the paste-me command again
+show                  print the paste-me command (long, so it's not dumped at startup)
 copy                  copy it to the clipboard
 link                  print the browser upload link (no shell needed)
 copylink              copy that link instead
@@ -303,7 +311,7 @@ name <name>           cloudflared tunnel name
 token <token>         tunnel token for `mode token`
 url <base-url>        base URL for `mode url`
 exclude <patterns>    what `send` never uploads ('exclude -' clears it)
-apply                 bring the chosen mode up and reprint the command
+apply                 bring the chosen mode up (`show` to see the new command)
 newurl                re-roll the quick tunnel URL (Cloudflare picks it)
 login                 authorise cloudflared for `mode domain`
 
@@ -316,8 +324,9 @@ quit                  stop easycp
 ```
 
 Log lines stream into the terminal while you sit at the prompt. With no
-terminal attached (`nohup`, systemd, a pipe) `--headless` prints the command
-and just keeps running.
+terminal attached (`nohup`, systemd, a pipe) there's no prompt to type `show`
+at, so `--headless` prints the command up front instead, then just keeps
+running.
 
 On Windows a console starts with escape processing switched off, which would
 print every colour as a literal `←[1m`, so easycp turns it on at startup. If
@@ -389,8 +398,10 @@ DZ_EXCLUDE=".git" send /var/www/html    # keep .env this time
 DZ_EXCLUDE= send /var/www/html          # send absolutely everything
 ```
 
-Run `peek` first if you are unsure — it prints the exact file list and the
-gzipped upload size without sending a byte.
+Run `peek` first if you are unsure — it prints the exact file list without
+sending a byte. Add `-s` (or `-size`) if you also want the gzipped upload
+size; that means actually compressing everything first, so it's the slower
+path and off by default.
 
 ## Command line
 

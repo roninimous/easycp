@@ -1581,6 +1581,13 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
         # every flag resolves to a kind, so peek and send parse them the same way
         '_dzk() { case "$1" in -a|-all) echo all;; -af|-allfiles) echo f;; '
         '-ad|-alldirs|-alldirectories) echo d;; esac; }; '
+        # peek's listing, from a tar that is compressed only when $sz=1 -
+        # gzipping everything just to print names is the slow part -s skips
+        '_dzshow() { tar -tf "$1" | sed "s/^/   /" | head -30; '
+        'n=$(tar -tf "$1" | wc -l | tr -d " "); '
+        'if [ "$sz" = 1 ]; then echo "   ---- $n entries, '
+        '$(wc -c < "$1" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
+        'else echo "   ---- $n entries  (add -s for the gzipped size)"; fi; }; '
     )
 
     # "${@:-.}" makes a bare `peek` or `send` mean "this directory", which is
@@ -1604,27 +1611,48 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
         'COPYFILE_DISABLE=1 tar -C "$q" $(_dzx) -czf %s -T "$l"'
     )
 
+    # send always gzips - it's the actual upload, so the compression pays for
+    # itself. peek only does when $sz=1 (-s/-size); by default it builds a
+    # plain tar, which skips the compression that makes a big peek slow.
+    peek_tar = (
+        'tf=""; [ "$sz" = 1 ] && tf=z; '
+        'COPYFILE_DISABLE=1 tar -C "$q" $(_dzx) -c${tf}f %s -T "$l"'
+    )
+    peek_tar_path = (
+        'tf=""; [ "$sz" = 1 ] && tf=z; '
+        'COPYFILE_DISABLE=1 tar -C "$d" $(_dzx) -c${tf}f %s "$b"'
+    )
+
+    # kept as one string so it reads top-to-bottom in the source even though
+    # it lands in the middle of peek()'s one-liner
+    peek_help = (
+        'echo "peek - preview what send would upload, without sending it"; echo; '
+        'echo "  peek [path...]         list one path (a file or a whole folder)"; '
+        'echo "  peek                   (no args) lists the current directory"; '
+        'echo "  peek -a  [path]        top-level files and folders, loose (-all)"; '
+        'echo "  peek -af [path]        top-level files only (-allfiles)"; '
+        'echo "  peek -ad [path]        top-level folders only (-alldirectories)"; '
+        'echo "  peek -r PATTERN [dir]  files matching PATTERN anywhere under dir (-recursive)"; '
+        'echo; '
+        'echo "  peek -s ...            also gzip everything to show the upload size (-size)"; '
+        'echo "                         slower, since that means actually compressing it"; '
+        'echo "  send takes the same flags (minus -s) and actually uploads"; '
+    )
+
     peek = (
-        'peek() { case "$1" in -r|-recursive) _dzrp "$@" || return 1; '
-        't=$(mktemp); ' + (flag_tar % '"$t"') + '; '
-        'echo "== $q"; tar -tzf "$t" | sed "s/^/   /" | head -30; '
-        'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
-        '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
-        'rm -f "$t" "$l"; return; esac; '
+        'peek() { sz=0; case "$1" in -s|-size) sz=1; shift;; esac; '
+        'case "$1" in -h|-help|--help) ' + peek_help + 'return;; '
+        '-r|-recursive) _dzrp "$@" || return 1; '
+        't=$(mktemp); ' + (peek_tar % '"$t"') + '; '
+        'echo "== $q"; _dzshow "$t"; rm -f "$t" "$l"; return; esac; '
         'k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
-        't=$(mktemp); ' + (flag_tar % '"$t"') + '; '
-        'echo "== $q"; tar -tzf "$t" | sed "s/^/   /" | head -30; '
-        'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
-        '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
-        'rm -f "$t" "$l"; return; fi; '
+        't=$(mktemp); ' + (peek_tar % '"$t"') + '; '
+        'echo "== $q"; _dzshow "$t"; rm -f "$t" "$l"; return; fi; '
         'for p in "${@:-.}"; do m=$(_dzm "$p"); '
         'if [ -z "$m" ]; then echo "no such path: $p"; continue; fi; '
         'printf "%s\\n" "$m" | while IFS= read -r p; do ' + guard +
-        't=$(mktemp); COPYFILE_DISABLE=1 tar -C "$d" $(_dzx) -czf "$t" "$b"; echo "== $q"; '
-        'tar -tzf "$t" | sed "s/^/   /" | head -30; '
-        'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
-        '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
-        'rm -f "$t"; done; done; }; '
+        't=$(mktemp); ' + (peek_tar_path % '"$t"') + '; echo "== $q"; '
+        '_dzshow "$t"; rm -f "$t"; done; done; }; '
     )
 
     if not chunk_mb:
@@ -1666,7 +1694,23 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
         'COPYFILE_DISABLE=1 tar -C "$d" $(_dzx) -czf - "$b" | _dzup "$b"; '
         'done; done; }'
     )
-    return prelude + up + peek + send
+
+    # the wordmark reuses WORDMARK verbatim (single-quoted per line, via
+    # printf rather than echo, since it's full of backslashes and one
+    # backtick that a plain echo cannot be trusted to pass through as-is)
+    banner_sh = "printf '%s\\n' " + " ".join(
+        "'" + line.replace("'", "'\\''") + "'"
+        for line in WORDMARK.strip("\n").split("\n")
+    ) + " ''; "
+
+    # both functions are gone the moment this shell closes - say so, and wipe
+    # the pasted one-liner off the screen rather than leave it sitting there
+    footer = (
+        '; clear; ' + banner_sh +
+        'echo "peek and send are set up in this shell - '
+        'they will go away once it closes"'
+    )
+    return prelude + up + peek + send + footer
 
 
 def chunk_for(mode, base, override="auto"):
@@ -2602,14 +2646,14 @@ input[type=file]{display:none}
   <div id="ok" class="done-msg" hidden></div>
 
   <div id="zone">
-    <pre class="target" aria-hidden="true">       ___
-      |   |
-      |   |
-   ___|   |___
-   \         /
-    \       /
-     \     /
-      \___/
+    <pre class="target" aria-hidden="true">      ___
+     |   |
+     |   |
+  ___|   |___
+  \         /
+   \       /
+    \     /
+     \___/
 
 |             |
 |             |
@@ -3315,7 +3359,11 @@ WORDMARK = r"""
 """
 
 
-def banner(app):
+def banner(app, full=True):
+    """full=False skips the (long) paste-me command - used at the interactive
+    prompt, where `show` is one word away. The piped/nohup fallback has no
+    prompt to type that at, so it keeps getting the command printed in full.
+    """
     out = [paint(WORDMARK, BOLD)]
     out.append(f"  saving to   {tilde(DEST)}")
     out.append(f"  listening   {app.base}")
@@ -3323,10 +3371,15 @@ def banner(app):
         out.append(f"  splitting   {app.chunk}MB per request (proxy body limit)")
     out.append(f"  skipping    {app.exclude or '(nothing)'}")
     out.append("")
-    out.append("  1. paste this into your VPS shell:")
-    out.append("")
-    out.append("     " + app.snippet())
-    out.append("")
+    if full:
+        out.append("  1. paste this into your VPS shell:")
+        out.append("")
+        out.append("     " + app.snippet())
+        out.append("")
+    else:
+        out.append("  1. type " + paint("show", BOLD) +
+                   " to print the paste-me command (it's long, so it's not "
+                   "dumped here), then paste it into your VPS shell")
     out.append("  2. then:  " + paint("peek /path", BOLD) + "  to preview,  "
                + paint("send /path", BOLD) + "  to copy it here")
     out.append("")
@@ -3342,7 +3395,7 @@ def banner(app):
 
 def repl(app):
     """--headless: everything the browser UI does, driven from the prompt."""
-    print(banner(app))
+    print(banner(app, full=False))
     prompt = paint("easycp>", BOLD) + " "
     while True:
         try:
@@ -3455,16 +3508,19 @@ def repl(app):
         elif cmd in ("exclude", "skip"):
             app.set_exclude("" if rest == "-" else rest)
             print(f"  skipping {app.exclude or '(nothing)'}")
-            print("\n     " + app.snippet() + "\n")
+            print("  the paste-me command changed - type " + paint("show", BOLD)
+                  + " to see it, " + paint("help", BOLD) + " for everything else")
         elif cmd in ("apply", "go", "connect"):
             ok, msg = app.apply()
             print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
-            print("\n     " + app.snippet() + "\n")
+            print("  type " + paint("show", BOLD) + " to see the paste-me command, "
+                  + paint("help", BOLD) + " for everything else")
         elif cmd in ("newurl", "reroll"):
             ok, msg = app.new_url()
             print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
             if ok:
-                print("\n     " + app.snippet())
+                print("  type " + paint("show", BOLD) + " to see the updated command, "
+                      + paint("help", BOLD) + " for everything else")
                 print("\n     " + app.drop_url() + "\n")
         elif cmd == "login":
             done = threading.Event()
