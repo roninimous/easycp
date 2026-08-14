@@ -45,6 +45,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -110,6 +111,20 @@ def tilde(path):
         return "~/" + str(Path(path).relative_to(Path.home()))
     except ValueError:
         return str(path)
+
+
+def unescape_path(raw):
+    """Undo shell-style backslash escapes from a pasted path.
+
+    Finder's "Copy as Pathname" (and drag-and-drop into some terminals) escapes
+    spaces and other punctuation as a shell would - `/AI\\ Assistant.png` - but
+    the headless prompt reads the line raw, with no shell to unescape it.
+    """
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return raw
+    return parts[0] if len(parts) == 1 else raw
 
 
 def in_dest(path):
@@ -3111,7 +3126,7 @@ def repl(app):
             done.wait()
         elif cmd == "dest":
             if rest:
-                set_dest(Path(rest).expanduser())
+                set_dest(Path(unescape_path(rest)).expanduser())
                 app.push()
             print(f"  saving to {tilde(DEST)}")
         elif cmd == "open":
@@ -3123,10 +3138,11 @@ def repl(app):
                 app.push()
                 print("  logo removed")
             elif rest:
+                path = unescape_path(rest)
                 try:
-                    data = Path(rest).expanduser().read_bytes()
+                    data = Path(path).expanduser().read_bytes()
                 except OSError as e:
-                    print(f"  could not read {rest}: {e}")
+                    print(f"  could not read {path}: {e}")
                 else:
                     ok, msg = set_logo(data)
                     if ok:
