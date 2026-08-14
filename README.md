@@ -235,6 +235,14 @@ Log lines stream into the terminal while you sit at the prompt. With no
 terminal attached (`nohup`, systemd, a pipe) `--headless` prints the command
 and just keeps running.
 
+On Windows a console starts with escape processing switched off, which would
+print every colour as a literal `←[1m`, so easycp turns it on at startup. If
+the console refuses — an old one, or output redirected to a file — everything
+falls back to plain text, and `qr` says so rather than printing a screenful of
+escapes, since the code is drawn entirely in colour. Windows Terminal needs
+none of this. Note that a QR wants 82 columns and the classic console window
+is 80, so widen it or use `qr tiny`.
+
 ## Connection modes
 
 Pick one in the **Connection** card, or `mode <name>` then `apply` at the

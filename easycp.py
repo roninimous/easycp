@@ -2759,7 +2759,31 @@ def open_folder(path):
 ANSI = {"ok": "\033[32m", "warn": "\033[33m", "bad": "\033[31m",
         "dim": "\033[90m", "msg": ""}
 DIM, BOLD, OFF = "\033[90m", "\033[1m", "\033[0m"
-TTY = sys.stdout.isatty()
+
+
+def enable_ansi():
+    """A Windows console starts with escape processing off, so anything we
+    colour arrives as a literal <-[1m. Ask for it; if the console will not
+    give it, say so, and everything below prints plain instead."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)              # stdout
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False                                 # redirected, not a console
+        VT = 0x0004                                      # VIRTUAL_TERMINAL_PROCESSING
+        if mode.value & VT:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | VT))
+    except Exception:
+        return False
+
+
+COLOUR = enable_ansi()
+TTY = sys.stdout.isatty() and COLOUR
 
 
 def paint(text, code):
@@ -2895,8 +2919,17 @@ def repl(app):
             want = rest.strip().lower()
             style = want if want in ("tiny", "low") else ""
             rows_ = qr_rows(app.drop_url())
-            art = qr_ansi(rows_, style=style)
-            if art:
+            art = qr_ansi(rows_, style=style) if TTY else ""
+            if not TTY:
+                # the code is drawn entirely in colour; without it there is
+                # nothing to scan, so do not print a screenful of escapes
+                print("\n  this console will not do colour, so a QR here "
+                      "could not be scanned")
+                if os.name == "nt":
+                    print("  Windows Terminal handles it, or open the browser "
+                          "panel without --headless")
+                print("\n     " + app.drop_url() + "\n")
+            elif art:
                 # a code wider than the window wraps, and a wrapped QR is not
                 # a QR - better to say so than to print something unscannable
                 need = (len(rows_) + 4) * (1 if style == "tiny" else 2)
@@ -2907,7 +2940,13 @@ def repl(app):
                                 + ("" if style == "tiny" else ", or try `qr tiny`"),
                                 ANSI["warn"]))
                 print()
-                print(art)
+                try:
+                    print(art)
+                except UnicodeEncodeError:
+                    # a console stuck on a legacy code page cannot encode the
+                    # half blocks; the default shape is spaces and always can
+                    print(qr_ansi(rows_))
+                    style = ""
                 print("\n     " + app.drop_url())
                 if not style and need <= have:
                     print(paint("     `qr tiny` is a quarter the size (or "
