@@ -129,18 +129,45 @@ same tunnel URL also serves an upload page, **EasyDrop**:
 https://your-tunnel.trycloudflare.com/drop?k=<key>
 ```
 
-**Copy link** in the control panel, or `link` / `copylink` at the prompt. Send
-it to whoever is holding the files; they open it in any browser and drag files
-or whole folders onto the page. Folders keep their structure, progress is shown
-per file, and everything lands in `~/EasyDrop` exactly as `send` would deliver
-it. Nothing to install on their side — it works from Windows, a phone, or a
+**Copy link** in the control panel, or `link` / `copylink` at the prompt. The
+panel also shows the link as a **QR code** — hand someone your screen and they
+can scan it with a phone camera instead of retyping a random subdomain and a
+key. At the prompt, `qr` prints the same code straight into the terminal, in
+black and white so it scans whatever your colour theme is.
+
+A terminal cell is roughly twice as tall as it is wide, so a module has to be
+either two cells wide or half a cell tall to come out square. The default takes
+the first route — two spaces per module — because a space is the one character
+every terminal renders in exactly one cell, at exactly one width.
+
+`qr tiny` takes the second, packing two module rows into one line with a half
+block. That is a quarter of the area, but it only works where the terminal
+draws that glyph as a clean half cell. Where the terminal leaves any part of
+the cell unpainted the dark rows come out striped — a solid dark cell is
+emitted as black ink on a black ground, so nothing in the output can put a
+light line through it, and nothing on this side can take one out either. If
+you see stripes: try `qr low`, which draws the same code from the bottom of
+the cell instead of the top and dodges the seam on some terminals; turn line
+spacing down in your terminal settings; or just use the default, which has no
+glyph in it at all.
+
+Either way, if the code needs more columns than the window has it would wrap —
+and a wrapped QR is not a QR — so easycp measures the terminal first and tells
+you to widen it instead of printing something unscannable.
+
+Send the link to whoever is holding the files; they open it in any browser and
+drag files or whole folders onto the page. Folders keep their structure, progress is shown
+per file as an ASCII bar in a terminal-style panel — the same `#` bar `curl`
+draws on the other side of the transfer — and everything lands in `~/EasyDrop`
+exactly as `send` would deliver it. Nothing to install on their side — it works from Windows, a phone, or a
 locked-down machine.
 
 <img src="docs/easydrop-ui.png" alt="The EasyDrop page mid-upload: a drop target,
 a queue of four files with per-file progress bars, and an overall progress bar
 with transfer speed" width="700">
 
-*What the sender sees. Two files done, one in flight — no shell, no install.*
+*What the sender sees: a terminal-style transfer log with ASCII progress bars.
+Two files done, one in flight — no shell, no install.*
 
 The link carries the key, so treat it like a password: anyone who has it can
 upload to your machine until easycp restarts and issues a new one.
@@ -185,6 +212,7 @@ show                  print the paste-me command again
 copy                  copy it to the clipboard
 link                  print the browser upload link (no shell needed)
 copylink              copy that link instead
+qr [tiny|low]         print that link as a QR code to scan with a phone
 status                where files land, what is listening, what is skipped
 log [n]               replay the last n log lines
 
@@ -195,6 +223,7 @@ token <token>         tunnel token for `mode token`
 url <base-url>        base URL for `mode url`
 exclude <patterns>    what `send` never uploads ('exclude -' clears it)
 apply                 bring the chosen mode up and reprint the command
+newurl                re-roll the quick tunnel URL (Cloudflare picks it)
 login                 authorise cloudflared for `mode domain`
 
 dest [path]           show or change where files land
@@ -224,6 +253,34 @@ the tunnel and the DNS record for you. Settings persist to `~/.dropzone.json`.
 
 Direct/LAN is not reachable from a VPS on the internet — it is for machines on
 your own network, and it skips Cloudflare's 100MB request cap entirely.
+
+### Getting a different quick tunnel URL
+
+**New URL** in the Connection card — or `newurl` at the prompt — throws the
+current quick tunnel away and takes a fresh one. Useful when a link has been
+shared more widely than you meant, or you just want a clean one.
+
+It is a re-roll, not a rename: Cloudflare picks the name. The command and the
+EasyDrop link both change, and the old URL stops answering the moment the old
+tunnel dies, so anyone still holding it gets nothing.
+
+### Can I choose the subdomain, like `something-easycp.trycloudflare.com`?
+
+No. Quick tunnels are anonymous and temporary — `cloudflared` is handed a
+random subdomain from Cloudflare's own word list, and there is no flag, API or
+retry that lets you influence it. `trycloudflare.com` is Cloudflare's domain,
+not yours.
+
+For a name you control, use **My domain** with a domain you own and point it
+wherever you like:
+
+```bash
+python3 easycp.py --tunnel domain --hostname easycp.example.com
+```
+
+That gives you a stable `easycp.example.com` that survives restarts, instead
+of a new random name every run — which is usually what people are really after
+when they ask for a custom quick-tunnel name.
 
 ## What actually gets sent
 
@@ -269,6 +326,11 @@ python3 easycp.py --headless --tunnel off
 ```
 
 ## How it works
+
+The QR code is generated in-process — byte mode, error level M, versions 1 to
+10 — because pulling in a QR library would break the one-file, stdlib-only
+promise. It was checked against Apple's `CIQRCodeGenerator` (identical
+matrices) and every code it produces is decoded back before shipping.
 
 `tar` streams the path straight into `curl -T`, so nothing is staged on the VPS
 disk. Because a pipe has no known length, curl uses chunked transfer encoding;

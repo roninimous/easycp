@@ -172,6 +172,399 @@ def save_config(cfg):
 
 
 # --------------------------------------------------------------------------
+# QR codes
+#
+# A QR encoder small enough to live in a stdlib-only script: byte mode, error
+# level M, versions 1-10, which covers any URL we would ever put on screen.
+# Everything here is straight out of ISO/IEC 18004. Verified against Apple's
+# CIQRCodeGenerator (identical matrices) and its decoder.
+# --------------------------------------------------------------------------
+
+# total codewords (data + error correction) per version
+QR_TOTAL = {1: 26, 2: 44, 3: 70, 4: 100, 5: 134,
+            6: 172, 7: 196, 8: 242, 9: 292, 10: 346}
+
+# level M: (ec codewords per block, blocks1, data per block1, blocks2, data per block2)
+QR_BLOCKS = {
+    1: (10, 1, 16, 0, 0), 2: (16, 1, 28, 0, 0), 3: (26, 1, 44, 0, 0),
+    4: (18, 2, 32, 0, 0), 5: (24, 2, 43, 0, 0), 6: (16, 4, 27, 0, 0),
+    7: (18, 4, 31, 0, 0), 8: (22, 2, 38, 2, 39), 9: (22, 3, 36, 2, 37),
+    10: (26, 4, 43, 1, 44),
+}
+
+# alignment pattern centres
+QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+            6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46],
+            10: [6, 28, 50]}
+
+# GF(256), primitive polynomial 0x11d
+GF_EXP = [0] * 512
+GF_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    GF_EXP[_i] = _x
+    GF_LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+for _i in range(255, 512):
+    GF_EXP[_i] = GF_EXP[_i - 255]
+
+
+def _gf_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return GF_EXP[GF_LOG[a] + GF_LOG[b]]
+
+
+def _rs_gen(n):
+    """Generator polynomial for n error-correction codewords."""
+    g = [1]
+    for i in range(n):
+        g = [0] + g
+        for j in range(len(g) - 1):
+            g[j] ^= _gf_mul(g[j + 1], GF_EXP[i])
+    return g[::-1]      # division below wants the leading coefficient first
+
+
+def _rs_ec(data, n):
+    g = _rs_gen(n)
+    rem = list(data) + [0] * n
+    for i in range(len(data)):
+        c = rem[i]
+        if c:
+            for j in range(len(g)):
+                rem[i + j] ^= _gf_mul(g[j], c)
+    return rem[len(data):]
+
+
+def _bits(data_bits, version):
+    """Data bit string -> interleaved codewords, ready for placement."""
+    ec_n, b1, d1, b2, d2 = QR_BLOCKS[version]
+    total_data = b1 * d1 + b2 * d2
+
+    # terminator, byte alignment, then the standard alternating padding
+    bits = data_bits + "0" * min(4, total_data * 8 - len(data_bits))
+    bits += "0" * (-len(bits) % 8)
+    pad = ("11101100", "00010001")
+    i = 0
+    while len(bits) < total_data * 8:
+        bits += pad[i % 2]
+        i += 1
+    cws = [int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)]
+
+    blocks, ecs, at = [], [], 0
+    for count, size in ((b1, d1), (b2, d2)):
+        for _ in range(count):
+            blocks.append(cws[at:at + size])
+            ecs.append(_rs_ec(blocks[-1], ec_n))
+            at += size
+
+    out = []
+    for i in range(max(d1, d2)):
+        for b in blocks:
+            if i < len(b):
+                out.append(b[i])
+    for i in range(ec_n):
+        for e in ecs:
+            out.append(e[i])
+    return out
+
+
+def _template(version):
+    """Function patterns, plus a map of which modules they occupy."""
+    size = version * 4 + 17
+    m = [[0] * size for _ in range(size)]
+    used = [[False] * size for _ in range(size)]
+
+    def put(r, c, v):
+        m[r][c], used[r][c] = v, True
+
+    for (br, bc) in ((0, 0), (0, size - 7), (size - 7, 0)):
+        for r in range(-1, 8):
+            for c in range(-1, 8):
+                rr, cc = br + r, bc + c
+                if 0 <= rr < size and 0 <= cc < size:
+                    edge = r in (0, 6) and 0 <= c <= 6
+                    side = c in (0, 6) and 0 <= r <= 6
+                    core = 2 <= r <= 4 and 2 <= c <= 4
+                    put(rr, cc, 1 if (edge or side or core) else 0)
+
+    for i in range(8, size - 8):          # timing
+        put(6, i, 1 - i % 2)
+        put(i, 6, 1 - i % 2)
+
+    centres = QR_ALIGN[version]
+    for r in centres:
+        for c in centres:
+            if (r < 8 and c < 8) or (r < 8 and c > size - 9) \
+                    or (r > size - 9 and c < 8):
+                continue
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    put(r + dr, c + dc,
+                        1 if max(abs(dr), abs(dc)) != 1 else 0)
+
+    put(size - 8, 8, 1)                   # the always-dark module
+    for i in range(9):                    # format info areas
+        if not used[8][i]:
+            put(8, i, 0)
+        if not used[i][8]:
+            put(i, 8, 0)
+    for i in range(8):
+        put(8, size - 1 - i, 0)
+        put(size - 1 - i, 8, 0)
+    if version >= 7:                      # version info areas
+        for i in range(6):
+            for j in range(3):
+                put(size - 11 + j, i, 0)
+                put(i, size - 11 + j, 0)
+    return m, used
+
+
+def _place(m, used, codewords):
+    size = len(m)
+    bits = "".join(f"{c:08b}" for c in codewords)
+    i, up = 0, True
+    col = size - 1
+    while col > 0:
+        if col == 6:                      # skip the vertical timing line
+            col -= 1
+        rows = range(size - 1, -1, -1) if up else range(size)
+        for row in rows:
+            for c in (col, col - 1):
+                if not used[row][c]:
+                    m[row][c] = int(bits[i]) if i < len(bits) else 0
+                    i += 1
+        up = not up
+        col -= 2
+
+
+MASKS = [
+    lambda r, c: (r + c) % 2 == 0,
+    lambda r, c: r % 2 == 0,
+    lambda r, c: c % 3 == 0,
+    lambda r, c: (r + c) % 3 == 0,
+    lambda r, c: (r // 2 + c // 3) % 2 == 0,
+    lambda r, c: (r * c) % 2 + (r * c) % 3 == 0,
+    lambda r, c: ((r * c) % 2 + (r * c) % 3) % 2 == 0,
+    lambda r, c: ((r + c) % 2 + (r * c) % 3) % 2 == 0,
+]
+
+
+def _format_bits(mask):
+    """15-bit BCH format string for level M (01... no: M is 00)."""
+    fmt = (0b00 << 3) | mask          # level M = 00
+    v = fmt << 10
+    for i in range(4, -1, -1):
+        if v & (1 << (i + 10)):
+            v ^= 0b10100110111 << i
+    return ((fmt << 10) | v) ^ 0b101010000010010
+
+
+def _version_bits(version):
+    v = version << 12
+    for i in range(5, -1, -1):
+        if v & (1 << (i + 12)):
+            v ^= 0b1111100100101 << i
+    return (version << 12) | v
+
+
+def _apply(m, used, mask):
+    size = len(m)
+    out = [row[:] for row in m]
+    for r in range(size):
+        for c in range(size):
+            if not used[r][c] and MASKS[mask](r, c):
+                out[r][c] ^= 1
+
+    fmt = _format_bits(mask)
+    for i in range(15):
+        bit = (fmt >> i) & 1
+        # copy one: down column 8, then left along row 8
+        if i < 6:
+            out[i][8] = bit
+        elif i == 6:
+            out[7][8] = bit
+        elif i == 7:
+            out[8][8] = bit
+        elif i == 8:
+            out[8][7] = bit
+        else:
+            out[8][14 - i] = bit
+        # copy two: right along row 8, then up column 8
+        if i < 8:
+            out[8][size - 1 - i] = bit
+        else:
+            out[size - 15 + i][8] = bit
+    out[size - 8][8] = 1
+
+    if size >= 45:                        # version 7+
+        vb = _version_bits((size - 17) // 4)
+        for i in range(18):
+            bit = (vb >> i) & 1
+            out[i // 3][size - 11 + i % 3] = bit
+            out[size - 11 + i % 3][i // 3] = bit
+    return out
+
+
+def _penalty(m):
+    size = len(m)
+    score = 0
+    for line in [m[r] for r in range(size)] + \
+                [[m[r][c] for r in range(size)] for c in range(size)]:
+        run, prev = 0, -1
+        for v in line:
+            if v == prev:
+                run += 1
+                if run == 5:
+                    score += 3
+                elif run > 5:
+                    score += 1
+            else:
+                prev, run = v, 1
+        # finder-like patterns, with the required light run on either side
+        s = "".join(str(v) for v in line)
+        for pat in ("1011101" + "0000", "0000" + "1011101"):
+            start = 0
+            while True:
+                at = s.find(pat, start)
+                if at < 0:
+                    break
+                score += 40
+                start = at + 1
+    for r in range(size - 1):
+        for c in range(size - 1):
+            block = m[r][c] + m[r][c + 1] + m[r + 1][c] + m[r + 1][c + 1]
+            if block in (0, 4):
+                score += 3
+    dark = sum(sum(row) for row in m)
+    score += 10 * (abs(dark * 100 // (size * size) - 50) // 5)
+    return score
+
+
+_QR_CACHE = {}
+
+
+def qr_rows(text):
+    """The matrix as a list of '0101' strings, cached - the URL rarely moves
+    but as_dict() is called on every state push."""
+    if text not in _QR_CACHE:
+        _QR_CACHE.clear()               # only ever one URL at a time
+        try:
+            _QR_CACHE[text] = ["".join(str(v) for v in row) for row in qr(text)]
+        except Exception as e:
+            log(f"could not build a QR code: {e}")
+            _QR_CACHE[text] = []
+    return _QR_CACHE[text]
+
+
+# Palette indices 16 and 231 are the fixed black and white of the 256-colour
+# cube. The named colours (30/40/97/107) are whatever the user's theme decided
+# they are, which for a QR is the difference between scanning and not.
+QR_BLACK_BG, QR_WHITE_BG = "\033[48;5;16m", "\033[48;5;231m"
+QR_BLACK_FG, QR_WHITE_FG = "\033[38;5;16m", "\033[38;5;231m"
+QR_OFF = "\033[0m"
+
+
+def _qr_grid(matrix, quiet):
+    n = len(matrix[0])
+    width = n + quiet * 2
+    grid = [[0] * width for _ in range(quiet)]
+    for row in matrix:
+        grid.append([0] * quiet + [1 if str(v) == "1" else 0
+                                   for v in row] + [0] * quiet)
+    grid += [[0] * width for _ in range(quiet)]
+    return grid, width
+
+
+def qr_ansi(matrix, quiet=2, style=""):
+    """A QR a phone can actually scan off a terminal.
+
+    Scanners want dark on light, so this paints its own black and white
+    rather than trusting the terminal's theme.
+
+    A terminal cell is about twice as tall as it is wide, so a module has to
+    be either two cells wide or half a cell tall to come out square. Both
+    shapes are here; neither is stretched:
+
+      default  two spaces per module - 74 columns, and a space is the one
+               character every terminal renders in exactly one cell
+      tiny     one half block per two module rows - a quarter of the area,
+               but it needs a font with that glyph and a terminal that both
+               draws it as a clean half cell and does not treat it as
+               double-width. Where the terminal leaves any of the cell
+               unpainted the dark rows come out striped, which no amount of
+               care on this side can fix; `low` puts the ink at the bottom of
+               the cell instead of the top, which dodges it on some terminals
+    """
+    if not matrix:
+        return ""
+    grid, width = _qr_grid(matrix, quiet)
+
+    if style in ("tiny", "low"):
+        if len(grid) % 2:
+            grid.append([0] * width)      # the block needs pairs of rows
+        FG = {0: QR_WHITE_FG, 1: QR_BLACK_FG}
+        BG = {0: QR_WHITE_BG, 1: QR_BLACK_BG}
+        # upper block: ink is the top module, background the bottom one.
+        # lower block swaps both, so the same picture comes out with the
+        # glyph at the other end of the cell.
+        glyph = "▄" if style == "low" else "▀"
+        out = []
+        for y in range(0, len(grid), 2):
+            line, seen = "", None
+            for x in range(width):
+                top, bot = grid[y][x], grid[y + 1][x]
+                pair = (bot, top) if style == "low" else (top, bot)
+                if pair != seen:
+                    line += FG[pair[0]] + BG[pair[1]]
+                    seen = pair
+                line += glyph
+            out.append(line + QR_OFF)
+        return "\n".join(out)
+
+    cell = "  "                           # two cells wide = one square module
+    out = []
+    for row in grid:
+        line, seen = "", None
+        for v in row:
+            want = QR_BLACK_BG if v else QR_WHITE_BG
+            if want != seen:
+                line += want
+                seen = want
+            line += cell
+        out.append(line + QR_OFF)
+    return "\n".join(out)
+
+
+def qr(text):
+    """Returns the module matrix as a list of rows of 0/1."""
+    data = text.encode("utf-8")
+    for version in range(1, 11):
+        ec_n, b1, d1, b2, d2 = QR_BLOCKS[version]
+        cap_bits = (b1 * d1 + b2 * d2) * 8
+        count_bits = 8 if version < 10 else 16
+        if 4 + count_bits + len(data) * 8 <= cap_bits:
+            break
+    else:
+        raise ValueError("too long for a version 10 QR code")
+
+    bits = "0100" + format(len(data), f"0{count_bits}b")
+    bits += "".join(f"{b:08b}" for b in data)
+    cws = _bits(bits, version)
+
+    base, used = _template(version)
+    _place(base, used, cws)
+    best, best_score = None, None
+    for mask in range(8):
+        cand = _apply(base, used, mask)
+        s = _penalty(cand)
+        if best_score is None or s < best_score:
+            best, best_score = cand, s
+    return best
+
+# --------------------------------------------------------------------------
 # the logo - optional branding shown in the panel and on the drop page
 # --------------------------------------------------------------------------
 
@@ -1142,7 +1535,7 @@ class App:
 
     def as_dict(self):
         return {
-            "dropUrl": self.drop_url(),
+            "dropUrl": self.drop_url(), "qr": qr_rows(self.drop_url()),
             "logo": bool(LOGO["data"]), "logoV": LOGO["v"],
             "modes": MODES, "fieldLabels": FIELD_LABELS, "mode": self.mode,
             "hostname": self.hostname, "tunnel_name": self.tunnel_name,
@@ -1202,6 +1595,24 @@ class App:
 
     def apply_async(self, **kw):
         threading.Thread(target=lambda: self.apply(**kw), daemon=True).start()
+
+    def new_url(self):
+        """Throw the current quick tunnel away and take whatever URL comes
+        back. Cloudflare picks the name, so this is a re-roll, not a rename -
+        and the old link dies the moment the old tunnel does."""
+        if self.mode != "quick":
+            msg = "only Cloudflare quick tunnels get a random URL"
+            log(f"not re-rolling: {msg}")
+            return False, msg
+        old = self.base
+        log("asking Cloudflare for a new quick tunnel URL ...")
+        ok, msg = self.apply()
+        if ok and old:
+            log(f"the old link is dead now: {old}")
+        return ok, msg
+
+    def new_url_async(self):
+        threading.Thread(target=self.new_url, daemon=True).start()
 
     def login_async(self):
         self.busy, self.health = True, "busy"
@@ -1326,6 +1737,14 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .err{background:var(--bad);color:#fff;padding:10px 14px;border-radius:9px;margin-bottom:14px}
 
+.qrrow{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.qrrow pre.code{flex:1;min-width:220px;margin:0}
+.qrcol{display:flex;flex-direction:column;align-items:center;gap:6px;flex:none}
+/* a QR wants a light quiet zone whatever the page theme is doing */
+.qrbox{background:#fff;padding:8px;border-radius:8px;line-height:0}
+.qrbox svg{display:block;width:132px;height:132px;shape-rendering:crispEdges}
+.qrcap{color:var(--faint);font-size:11.5px}
+
 .brandlogo{max-height:34px;max-width:150px;object-fit:contain}
 .brandlogo.big{max-height:46px;max-width:170px}
 .brandrow{display:flex;align-items:center;gap:14px;margin-top:16px;
@@ -1374,6 +1793,7 @@ input[type=file]{display:none}
     <div class="hint" id="hint"></div>
     <div class="actions">
       <button class="btn" id="apply">Apply</button>
+      <button class="btn ghost" id="newurl" hidden>New URL</button>
       <button class="btn ghost" id="login">Log in to Cloudflare</button>
       <span class="meta" id="cfnote"></span>
     </div>
@@ -1397,7 +1817,13 @@ input[type=file]{display:none}
     <div class="chead"><h2>EasyDrop &mdash; send from a browser</h2>
       <span class="sub">for a Windows box, a phone, or anyone without a shell</span>
     </div>
-    <pre class="code" id="dropurl"></pre>
+    <div class="qrrow">
+      <div class="qrcol">
+        <div class="qrbox" id="qr"></div>
+        <div class="qrcap">Scan with a phone</div>
+      </div>
+      <pre class="code" id="dropurl"></pre>
+    </div>
     <div class="foot">
       <button class="btn ghost" id="copylink">Copy link</button>
       <span class="meta">Anyone with this link can upload here until easycp
@@ -1493,12 +1919,16 @@ function render(){
   $('#dest').textContent = S.dest;
   $('#snippet').textContent = S.snippet;
   $('#dropurl').textContent = S.dropUrl;
+  drawQr();
   logo();
   $('#listening').textContent = 'listening on ' + S.base +
     (S.chunk ? '   ·   split into ' + S.chunk + 'MB requests' : '');
   if (document.activeElement !== $('#excl')) $('#excl').value = S.exclude;
   $('#apply').disabled = S.busy;
   $('#apply').textContent = S.busy ? 'Connecting…' : 'Apply';
+  // only quick tunnels have a URL worth re-rolling
+  $('#newurl').hidden = S.mode !== 'quick';
+  $('#newurl').disabled = S.busy;
   $('#login').disabled = S.busy || S.mode !== 'domain';
   $('#cfnote').textContent = S.cloudflared
     ? (S.mode === 'domain' && !S.cfLoggedIn ? 'log in once to use your own domain' : '')
@@ -1526,6 +1956,14 @@ $('#apply').onclick = () => {
   S.busy = true; render();
   api('/api/connect', body).catch(e => alert(e.message));
 };
+$('#newurl').onclick = () => {
+  if (!confirm('Get a different quick tunnel URL?\n\n' +
+               'Cloudflare picks the name, so you cannot choose it. The ' +
+               'command and the EasyDrop link both change, and anyone still ' +
+               'holding the old link will find it dead.')) return;
+  S.busy = true; render();
+  api('/api/newurl', {}).catch(e => alert(e.message));
+};
 $('#login').onclick = () => api('/api/login', {}).catch(e => alert(e.message));
 $('#open').onclick = () => api('/api/open', {}).catch(e => alert(e.message));
 $('#quit').onclick = () => {
@@ -1539,6 +1977,25 @@ $('#excl').oninput = () => {
   const v = $('#excl').value;
   exclTimer = setTimeout(() => api('/api/exclude', {exclude:v}).catch(()=>{}), 350);
 };
+
+let qrDrawn = '';
+function drawQr(){
+  const rows = S.qr || [];
+  if (!rows.length){ $('#qr').parentElement.hidden = true; return; }
+  $('#qr').parentElement.hidden = false;
+  const key = rows.join('');
+  if (key === qrDrawn) return;              // same URL, same code
+  qrDrawn = key;
+  const n = rows.length, q = 2, side = n + q * 2;
+  let d = '';
+  for (let r = 0; r < n; r++)
+    for (let c = 0; c < n; c++)
+      if (rows[r][c] === '1') d += `M${c + q} ${r + q}h1v1h-1z`;
+  $('#qr').innerHTML =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${side} ${side}">` +
+    `<rect width="${side}" height="${side}" fill="#fff"/>` +
+    `<path d="${d}" fill="#000"/></svg>`;
+}
 
 function logo(){
   // ?v= busts the cache: same URL, new bytes after an upload
@@ -1699,26 +2156,56 @@ input[type=file]{display:none}
 .head h2{margin:0;font-size:15px;font-weight:600}
 .head .sub{color:var(--mute);font-size:12.5px;margin-left:auto}
 
-#rows{max-height:320px;overflow:auto;margin:0 -6px}
-.row{display:grid;grid-template-columns:1fr auto;gap:3px 12px;padding:7px 6px;
-  border-radius:8px;align-items:center}
-.row .nm{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+/* the transfer really is a terminal job, so it may as well look like one -
+   and an ASCII bar needs no colour to be readable */
+.term{background:#0b1020;border:1px solid #202a44;border-radius:var(--radius);
+  overflow:hidden;margin-bottom:14px}
+.termhead{display:flex;align-items:center;gap:8px;padding:9px 13px;
+  background:#151c30;border-bottom:1px solid #202a44}
+.termhead .d{width:10px;height:10px;border-radius:50%;flex:none}
+.termhead .r{background:#ff5f57} .termhead .y{background:#febc2e}
+.termhead .g{background:#28c840}
+.termhead .tt{margin-left:6px;color:#8b9ab1;font-size:12px;
   font-family:ui-monospace,Menlo,Consolas,monospace}
-.row .sz{color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums;
-  white-space:nowrap}
-.row .bar{grid-column:1/-1;height:4px;border-radius:3px;background:var(--track);
-  overflow:hidden}
-.row .bar i{display:block;height:100%;width:0;background:var(--accent);
-  transition:width .15s linear}
-.row.done .bar i{background:var(--good)}
-.row.bad .sz{color:var(--bad)} .row.bad .bar i{background:var(--bad)}
+.xbtn{margin-left:auto;background:none;border:1px solid #2c3a5a;color:#9aa8bf;
+  border-radius:6px;padding:3px 10px;font:inherit;font-size:12px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;cursor:pointer}
+.xbtn:hover{border-color:#f87171;color:#f87171}
 
-.total{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
-.total .bar{flex:1;min-width:160px;height:7px;border-radius:4px;background:var(--track);
-  overflow:hidden}
-.total .bar i{display:block;height:100%;width:0;background:var(--accent);
-  transition:width .15s linear}
-.total .txt{color:var(--mute);font-size:12.5px;font-variant-numeric:tabular-nums}
+.termbody{padding:12px 13px 13px;overflow-x:auto;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12.5px;line-height:1.65;color:#e2e8f0}
+#rows{max-height:300px;overflow-y:auto}
+.ln{display:grid;grid-template-columns:1fr auto auto auto;gap:0 12px;
+  align-items:baseline;white-space:pre}
+/* min-width:0 or the grid track refuses to shrink and the ellipsis never bites */
+.ln .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.ln .sz{color:#8b9ab1;font-variant-numeric:tabular-nums;text-align:right}
+.ln .bar{color:#4f83f1;white-space:pre}
+.ln .pc{color:#8b9ab1;font-variant-numeric:tabular-nums;text-align:right;
+  min-width:4.5em}
+.ln.done .bar{color:#34d399} .ln.done .pc{color:#34d399}
+.ln.bad .bar,.ln.bad .pc,.ln.bad .nm{color:#f87171}
+/* normal, not pre: these lines are wrapped across source lines in the markup */
+.ln.cmd{display:block;white-space:normal;color:#8b9ab1}
+.ln.cmd .pr{color:#34d399}
+.ln.cmd .dim{color:#64748b}
+.ln.total{margin-top:6px;padding-top:8px;border-top:1px solid #202a44;
+  color:#e2e8f0}
+.ln.total .bar{color:#e2e8f0}
+.ln.total .pc{min-width:0;color:#8b9ab1;white-space:nowrap}
+.cur{color:#4f83f1;animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+/* on a phone the path is worth more than one line: give it the whole width
+   and put size, bar and percentage underneath, rather than eliding it away */
+@media (max-width:560px){
+  .termbody{font-size:12px}
+  .ln{grid-template-columns:auto auto 1fr;gap:0 10px}
+  .ln .nm{grid-column:1/-1}
+  .ln .pc{justify-self:end;min-width:0}
+  .ln.total .nm{color:#8b9ab1}
+  #rows .ln{margin-bottom:5px}
+}
 .note{color:var(--faint);font-size:12.5px;margin-top:14px}
 .done-msg{background:var(--good);color:#fff;padding:11px 15px;border-radius:9px;
   margin-bottom:14px;font-weight:550}
@@ -1775,16 +2262,19 @@ input[type=file]{display:none}
     <input type="file" id="dirIn" webkitdirectory directory multiple>
   </div>
 
-  <section class="card" id="list" hidden>
-    <div class="head">
-      <h2 id="listTitle">Queue</h2>
-      <span class="sub" id="listSub"></span>
+  <section class="term" id="list" hidden>
+    <div class="termhead">
+      <i class="d r"></i><i class="d y"></i><i class="d g"></i>
+      <span class="tt">easydrop &mdash; upload</span>
+      <button class="xbtn" id="cancel" hidden>cancel</button>
     </div>
-    <div id="rows"></div>
-    <div class="total">
-      <div class="bar"><i id="allBar"></i></div>
-      <span class="txt" id="allTxt"></span>
-      <button class="btn ghost" id="cancel" hidden>Cancel</button>
+    <div class="termbody">
+      <div class="ln cmd"><span class="pr">$</span> <span id="listTitle"></span>
+        <span class="dim" id="listSub"></span></div>
+      <div id="rows"></div>
+      <div class="ln total"><span class="nm">total</span><span class="sz"></span
+        ><span class="bar" id="allBar"></span><span class="pc" id="allTxt"></span></div>
+      <div class="ln cmd"><span class="pr">$</span> <span class="cur">&#9608;</span></div>
     </div>
   </section>
 
@@ -1874,6 +2364,16 @@ $('#dirIn').onchange = e => add([...e.target.files].map(
   f => ({file: f, path: f.webkitRelativePath || f.name})));
 
 /* ---- queue + rendering ------------------------------------------------ */
+// bars are drawn with characters, so the width is in columns, not pixels -
+// narrow screens get a shorter bar rather than a sideways scroll
+function barWidth() { return window.innerWidth < 560 ? 10 : 22; }
+
+function bar(frac) {
+  const w = barWidth();
+  const n = Math.max(0, Math.min(w, Math.round(frac * w)));
+  return '[' + '#'.repeat(n) + '.'.repeat(w - n) + ']';
+}
+
 function add(found) {
   if (!found.length || busy) return;
   $('#ok').hidden = true; $('#fail').hidden = true;
@@ -1881,19 +2381,23 @@ function add(found) {
   $('#rows').textContent = '';
   for (const it of items) {
     const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = '<div class="nm"></div><div class="sz"></div>' +
-                    '<div class="bar"><i></i></div>';
+    row.className = 'ln';
+    row.innerHTML = '<span class="nm"></span><span class="sz"></span>' +
+                    '<span class="bar"></span><span class="pc"></span>';
     row.querySelector('.nm').textContent = it.path;
-    row.querySelector('.sz').textContent = human(it.file.size);
-    it.row = row; it.fill = row.querySelector('.bar i');
+    it.row = row;
     it.note = row.querySelector('.sz');
+    it.barEl = row.querySelector('.bar');
+    it.pcEl = row.querySelector('.pc');
+    it.note.textContent = human(it.file.size);
     $('#rows').append(row);
   }
   const bytes = items.reduce((n, i) => n + i.file.size, 0);
   $('#list').hidden = false;
-  $('#listTitle').textContent = items.length + (items.length === 1 ? ' file' : ' files');
-  $('#listSub').textContent = human(bytes);
+  $('#listTitle').textContent = 'send ' + items.length +
+                                (items.length === 1 ? ' file' : ' files');
+  $('#listSub').textContent = '# ' + human(bytes);
+  paint();
   send();
 }
 
@@ -1905,15 +2409,24 @@ function paint() {
     let sent = 0, total = 0;
     for (const it of items) {
       sent += it.sent; total += it.file.size;
-      const pct = it.file.size ? (it.sent / it.file.size) * 100 : (it.state ? 100 : 0);
-      it.fill.style.width = (it.state === 'done' ? 100 : pct) + '%';
+      const frac = it.state === 'done' ? 1
+                 : (it.file.size ? it.sent / it.file.size : 0);
+      it.barEl.textContent = bar(frac);
+      it.pcEl.textContent = it.msg || (it.state === 'done' ? 'ok'
+                                       : Math.floor(frac * 100) + '%');
     }
-    $('#allBar').style.width = (total ? (sent / total) * 100 : 0) + '%';
+    $('#allBar').textContent = bar(total ? sent / total : 0);
     const secs = (Date.now() - start) / 1000;
-    $('#allTxt').textContent = human(sent) + ' of ' + human(total) +
-      (busy && secs > 0.6 ? '  ·  ' + human(sent / secs) + '/s' : '');
+    $('#allTxt').textContent = human(sent) + '/' + human(total) +
+      (busy && secs > 0.6 ? '  ' + human(sent / secs) + '/s' : '');
   });
 }
+
+let sizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(paint, 150);     // re-draw bars at the new width
+});
 
 /* ---- uploading -------------------------------------------------------- */
 let start = Date.now();
@@ -1968,7 +2481,7 @@ async function putFile(id, it) {
       // a failed slice leaves a half-written part, so retry the whole file:
       // part 0 is what tells the receiver to start the file over
       if (cancelled || attempt >= 2) throw e;
-      it.sent = 0; it.note.textContent = 'retrying ...'; paint();
+      it.sent = 0; it.msg = 'retry'; paint();
       await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
     }
   }
@@ -2007,8 +2520,7 @@ async function send() {
       try {
         for (const it of b.list) {
           await putFile(id, it);
-          it.state = 'done'; it.row.classList.add('done');
-          it.note.textContent = human(it.file.size);
+          it.state = 'done'; it.msg = ''; it.row.classList.add('done');
           files++; bytes += it.file.size;
           paint();
         }
@@ -2021,7 +2533,8 @@ async function send() {
                            '  ·  ' + human(bytes);
   } catch (e) {
     const it = items.find(i => i.state !== 'done');
-    if (it) { it.row.classList.add('bad'); it.note.textContent = 'failed'; }
+    if (it) { it.state = 'bad'; it.msg = 'fail'; it.row.classList.add('bad'); }
+    paint();
     $('#fail').hidden = false;
     $('#fail').textContent = cancelled
       ? 'Cancelled. ' + files + ' of ' + items.length + ' files had already been sent.'
@@ -2166,6 +2679,14 @@ class Control(BaseHTTPRequestHandler):
         if path == "/api/exclude":
             app.set_exclude(body.get("exclude", ""))
             return self._json({"ok": True})
+        if path == "/api/newurl":
+            # answer the caller rather than letting the worker thread swallow it
+            if app.mode != "quick":
+                return self._json(
+                    {"ok": False,
+                     "error": "only Cloudflare quick tunnels get a random URL"}, 400)
+            app.new_url_async()
+            return self._json({"ok": True})
         if path == "/api/login":
             app.login_async()
             return self._json({"ok": True})
@@ -2283,6 +2804,9 @@ HELP = """
     copy                  copy it to the clipboard
     link                  print the browser upload link (no shell needed)
     copylink              copy that link instead
+    qr [tiny|low]         print that link as a QR code to scan with a phone
+                          (tiny = a quarter the size; low = the same, drawn
+                           from the bottom of the cell, if tiny is striped)
     status                where files land, what is listening, what is skipped
     log [n]               replay the last n log lines (default 20)
 
@@ -2293,6 +2817,7 @@ HELP = """
     url <base-url>        base URL for `mode url`
     exclude <patterns>    what `send` never uploads ('exclude -' clears it)
     apply                 bring the chosen mode up and reprint the command
+    newurl                re-roll the quick tunnel URL (Cloudflare picks it)
     login                 authorise cloudflared for `mode domain`
 
     dest [path]           show or change where files land
@@ -2340,7 +2865,7 @@ def banner(app):
 def repl(app):
     """--headless: everything the browser UI does, driven from the prompt."""
     print(banner(app))
-    prompt = paint("dz>", BOLD) + " "
+    prompt = paint("easycp>", BOLD) + " "
     while True:
         try:
             raw = input(prompt).strip()
@@ -2366,6 +2891,34 @@ def repl(app):
                 print("     " + app.snippet() + "\n")
         elif cmd == "link":
             print("\n     " + app.drop_url() + "\n")
+        elif cmd == "qr":
+            want = rest.strip().lower()
+            style = want if want in ("tiny", "low") else ""
+            rows_ = qr_rows(app.drop_url())
+            art = qr_ansi(rows_, style=style)
+            if art:
+                # a code wider than the window wraps, and a wrapped QR is not
+                # a QR - better to say so than to print something unscannable
+                need = (len(rows_) + 4) * (1 if style == "tiny" else 2)
+                have = shutil.get_terminal_size((80, 24)).columns
+                if need > have:
+                    print(paint(f"\n  this code needs {need} columns and the "
+                                f"window is {have} - widen it"
+                                + ("" if style == "tiny" else ", or try `qr tiny`"),
+                                ANSI["warn"]))
+                print()
+                print(art)
+                print("\n     " + app.drop_url())
+                if not style and need <= have:
+                    print(paint("     `qr tiny` is a quarter the size (or "
+                                "`qr low` if tiny comes out striped)", DIM))
+                elif style == "tiny":
+                    print(paint("     striped? try `qr low`, or turn line "
+                                "spacing down in your terminal settings", DIM))
+                print()
+            else:
+                print("  could not build a QR code - here is the link:")
+                print("     " + app.drop_url() + "\n")
         elif cmd == "copylink":
             if copy_to_clipboard(app.drop_url()):
                 print("  copied to the clipboard")
@@ -2414,6 +2967,12 @@ def repl(app):
             ok, msg = app.apply()
             print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
             print("\n     " + app.snippet() + "\n")
+        elif cmd in ("newurl", "reroll"):
+            ok, msg = app.new_url()
+            print(("  " + msg) if ok else paint("  " + msg, ANSI["bad"]))
+            if ok:
+                print("\n     " + app.snippet())
+                print("\n     " + app.drop_url() + "\n")
         elif cmd == "login":
             done = threading.Event()
 
