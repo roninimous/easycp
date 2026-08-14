@@ -1,9 +1,17 @@
-# easycp
+```
+  ___   __ _  ___   _   _   ___  _ __
+ / _ \ / _` |/ __| | | | | / __|| '_ \
+|  __/| (_| |\__ \ | |_| || (__ | |_) |
+ \___| \__,_||___/  \__, | \___|| .__/
+                    |___/       |_|
+```
+
+**[github.com/roninimous/easycp](https://github.com/roninimous/easycp)**
 
 Pull files off a remote box with one pasted command.
 
 No SSH keys to install, no `scp` syntax to remember, no inbound port on the
-server. You run DropZone on your own machine, copy one line, paste it into any
+server. You run easycp on your own machine, copy one line, paste it into any
 VPS shell, and then:
 
 ```bash
@@ -15,13 +23,19 @@ The folder lands in `~/DropZone`, unpacked and ready.
 ```
    your laptop                                     the VPS
 ┌──────────────────┐                        ┌────────────────────┐
-│  dropzone.py     │   <—— HTTPS PUT ——     │  send /var/www/html│
+│  easycp.py       │   <—— HTTPS PUT ——     │  send /var/www/html│
 │  ~/DropZone/     │      (outbound)        │  tar → curl        │
 └──────────────────┘                        └────────────────────┘
 ```
 
 The transfer is a **push from the server to you**, which is why the VPS needs
 no open port, no key exchange, and no client install beyond `tar` and `curl`.
+
+<img src="docs/host-ui.png" alt="The easycp control panel: connection modes, the
+paste-me command, the EasyDrop link, and a live activity log" width="820">
+
+*The control panel on the receiving machine — pick a connection mode, copy the
+command, and watch files land.*
 
 ## Requirements
 
@@ -35,11 +49,11 @@ mainstream distro already has.
 ## Quick start
 
 ```bash
-python3 dropzone.py
+python3 easycp.py
 ```
 
 A control panel opens in your browser with a command in it. Prefer the
-terminal? `python3 dropzone.py --headless` gives you the same controls at a
+terminal? `python3 easycp.py --headless` gives you the same controls at a
 prompt — no browser, no GUI toolkit, works over SSH.
 
 1. **Copy the command** and paste it into your VPS shell. Nothing prints — it
@@ -55,21 +69,64 @@ Files arrive in `~/DropZone`, and every file that lands is named in the
 activity log. `send` takes several paths at once:
 `send /etc/nginx/nginx.conf /var/log/app.log`.
 
+## EasyDrop — for whoever has no shell
+
+```
+ _____                      ____
+| ____|  __ _  ___   _   _ |  _ \  _ __   ___   _ __
+|  _|   / _` |/ __| | | | || | | || '__| / _ \ | '_ \
+| |___ | (_| |\__ \ | |_| || |_| || |   | (_) || |_) |
+|_____| \__,_||___/  \__, ||____/ |_|    \___/ | .__/
+                     |___/                     |_|
+```
+
+The snippet is POSIX shell — it does nothing useful in a Windows `cmd` or
+PowerShell prompt, and not everyone has a terminal at all. For those cases the
+same tunnel URL also serves an upload page, **EasyDrop**:
+
+```
+https://your-tunnel.trycloudflare.com/drop?k=<key>
+```
+
+**Copy link** in the control panel, or `link` / `copylink` at the prompt. Send
+it to whoever is holding the files; they open it in any browser and drag files
+or whole folders onto the page. Folders keep their structure, progress is shown
+per file, and everything lands in `~/DropZone` exactly as `send` would deliver
+it. Nothing to install on their side — it works from Windows, a phone, or a
+locked-down machine.
+
+<img src="docs/easydrop-ui.png" alt="The EasyDrop page mid-upload: a drop target,
+a queue of four files with per-file progress bars, and an overall progress bar
+with transfer speed" width="700">
+
+*What the sender sees. Two files done, one in flight — no shell, no install.*
+
+The link carries the key, so treat it like a password: anyone who has it can
+upload to your machine until easycp restarts and issues a new one.
+
 ## The two front ends
 
 There is no GUI toolkit anywhere — no Tk, no Qt, nothing to install.
 
-**Browser control panel** (default). DropZone serves a small page on
+**Browser control panel** (default). easycp serves a small page on
 `127.0.0.1` and opens it. The page is bound to loopback only, so the tunnel
 never exposes it, and every request carries a one-time key printed with the
 URL. It streams the activity log live over server-sent events.
 
-**Terminal** (`--headless`). Same engine, driven from a prompt. `help` lists
-everything:
+**Terminal** (`--headless`). Same engine, driven from a prompt.
+
+<img src="docs/cmd-ui.png" alt="easycp running headless in a terminal: the ASCII
+logo, the paste-me command, the EasyDrop link, and a colour-coded live log"
+width="820">
+
+*Everything the panel does, at a prompt — the log streams in colour while you
+type.* `help` lists the commands:
 
 ```
 show                  print the paste-me command again
 copy                  copy it to the clipboard
+link                  print the browser upload link (no shell needed)
+copylink              copy that link instead
 status                where files land, what is listening, what is skipped
 log [n]               replay the last n log lines
 
@@ -84,7 +141,7 @@ login                 authorise cloudflared for `mode domain`
 
 dest [path]           show or change where files land
 open                  open that folder in the file manager
-quit                  stop DropZone
+quit                  stop easycp
 ```
 
 Log lines stream into the terminal while you sit at the prompt. With no
@@ -131,7 +188,7 @@ gzipped upload size without sending a byte.
 ## Command line
 
 ```
-python3 dropzone.py [options]
+python3 easycp.py [options]
 
   --port PORT           listen port (default 8765)
   --dest DEST           where received files land (default ~/DropZone)
@@ -149,8 +206,8 @@ python3 dropzone.py [options]
 ```
 
 ```bash
-python3 dropzone.py --tunnel domain --hostname drop.example.com
-python3 dropzone.py --headless --tunnel off
+python3 easycp.py --tunnel domain --hostname drop.example.com
+python3 easycp.py --headless --tunnel off
 ```
 
 ## How it works
@@ -169,15 +226,30 @@ Cloudflare caps request bodies at 100MB, so behind a tunnel the stream is
 `split` into 90MB parts uploaded with an `X-Parts` header. The receiver buffers
 them under `.parts/` and concatenates once every part has arrived.
 
+The drop page uses the same receiver by a different door. A dropped folder is
+hundreds of separate uploads, so the batch — not the request — owns the
+destination: `/drop/begin` reserves one folder up front, every file is `PUT` to
+`/drop/put` with its relative path in an `X-Path` header, and `/drop/end`
+closes it out. Large files are sliced with `Blob.slice` to the same limit and
+appended server-side; each slice states the offset it expects to be written at,
+so a retried or out-of-order slice is refused rather than silently corrupting
+the file.
+
 ## Security notes
 
 - The token is regenerated **every launch**. A snippet pasted yesterday will
   401 today — re-copy it after each restart.
 - While a tunnel is up, that URL is a live endpoint on the public internet.
   It is token-protected, but it is reachable by anyone who has the URL and the
-  token. Close DropZone when you are done.
+  token. Close easycp when you are done.
 - Incoming filenames are stripped to a bare basename, so a hostile name cannot
-  escape the destination folder.
+  escape the destination folder. Browser drops keep their folder structure, so
+  there every path component is filtered instead: `..`, drive letters and
+  separators are dropped, and the assembled path is checked to be inside the
+  destination before anything is opened.
+- The drop link contains the upload key. Anyone you send it to — or anyone who
+  sees it in a chat log — can upload to your machine until you restart. It only
+  ever grants upload; nothing on your disk can be listed or read through it.
 - The control panel listens on `127.0.0.1` only and rejects requests whose
   `Host` or `Origin` is not loopback, so a web page you visit cannot drive it.
   Its key is regenerated every launch, like the upload token.
@@ -187,7 +259,7 @@ them under `.parts/` and concatenates once every part has arrived.
 - The pasted functions live only in that shell. A new SSH session or a
   `sudo su` needs a fresh paste — or append the snippet to `~/.bashrc`.
 - A long transfer dies with its SSH session. Use `tmux` for big ones.
-- Killing DropZone with `SIGTERM` (e.g. `pkill`) orphans its `cloudflared`
+- Killing easycp with `SIGTERM` (e.g. `pkill`) orphans its `cloudflared`
   child; Ctrl-C, `quit`, and the panel's Quit button shut it down properly.
 
 ## License

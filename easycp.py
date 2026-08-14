@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DropZone - pull files off a remote box with one pasted command.
+easycp - pull files off a remote box with one pasted command.
 
 Run this on YOUR machine (mac / windows / linux). It starts a tiny
 authenticated receiver, works out a reachable URL, and shows you a one-line
@@ -14,8 +14,8 @@ shell snippet. Paste that snippet into any VPS shell, then run:
 
 There are two front ends over the same engine, and no GUI toolkit in either:
 
-    python3 dropzone.py                 # control panel in your browser
-    python3 dropzone.py --headless      # same controls, from this terminal
+    python3 easycp.py                 # control panel in your browser
+    python3 easycp.py --headless      # same controls, from this terminal
 
 The control panel is a plain page served on 127.0.0.1 only - the tunnel never
 sees it. Type `help` at the headless prompt for the terminal equivalent.
@@ -28,17 +28,18 @@ call on the remote box:
     DZ_EXCLUDE= send /var/www/html           # send absolutely everything
 
 Want a stable address instead of a random trycloudflare.com one? Point a
-domain you own at DropZone:
+domain you own at easycp:
 
-    python3 dropzone.py --tunnel domain --hostname drop.example.com
-    python3 dropzone.py --tunnel token  --hostname drop.example.com \\
+    python3 easycp.py --tunnel domain --hostname drop.example.com
+    python3 easycp.py --tunnel token  --hostname drop.example.com \\
                         --tunnel-token eyJhIjoi...
-    python3 dropzone.py --tunnel off         # LAN / Tailscale only
+    python3 easycp.py --tunnel off         # LAN / Tailscale only
 
 Both front ends can do the same thing without any flags.
 """
 
 import argparse
+import base64
 import json
 import os
 import queue
@@ -69,6 +70,9 @@ LOG_HISTORY = []        # replayed into the GUI, which attaches its sink late
 CONFIG_PATH = Path.home() / ".dropzone.json"
 CF_DIR = Path.home() / ".cloudflared"
 _tunnel_proc = None
+# what the drop page slices large files into; the receiver serves it to the
+# page, so a mode change reaches the browser on its next reload
+DROP_CHUNK_MB = [0]
 
 
 def log(msg):
@@ -80,6 +84,17 @@ def log(msg):
             sink(line)
         except Exception:
             pass
+
+
+def _int(raw, default=0):
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def plural(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def human(n):
@@ -169,13 +184,103 @@ def unique_path(base):
     return base.with_name(f"{stem}-{secrets.token_hex(3)}{suffix}")
 
 
+# Windows keeps these reserved at any extension, and the receiving machine
+# may well be one - a browser upload is the one path where we do not control
+# what the sender's filesystem allowed.
+RESERVED = {"con", "prn", "aux", "nul", "clock$"} | {
+    f"{p}{i}" for p in ("com", "lpt") for i in range(1, 10)}
+MAX_DEPTH = 24
+
+
+# A denylist, not an allowlist: "café.txt" has to survive intact, so we take
+# out only what is dangerous - separators, the characters Windows forbids,
+# control codes, and the bidi overrides that let a name print as something
+# other than what it is.
+UNSAFE = re.compile("[\\x00-\\x1f\\x7f/\\\\:*?\"<>|"
+                    "\\u202a-\\u202e\\u2066-\\u2069\\ufeff]")
+
+
+def safe_segment(seg):
+    """One path component, reduced to something safe on every filesystem."""
+    # trailing dots and spaces are legal here but not on Windows, and
+    # stripping them is also what stops ".." surviving as a name
+    seg = UNSAFE.sub("_", seg).strip(" .")
+    if seg.split(".")[0].lower() in RESERVED:
+        seg = "_" + seg
+    return seg[:120]
+
+
+def safe_rel(raw):
+    """A browser-supplied relative path, split into components that cannot
+    escape the folder we join them onto.
+
+    Every segment is filtered, and `.`/`..`/drive letters are dropped
+    outright rather than sanitised into a name - `..` must not survive as
+    `__`, and `C:` must not become a folder.
+    """
+    parts = []
+    for seg in raw.replace("\\", "/").split("/"):
+        seg = seg.strip()
+        if not seg or seg in (".", "..") or re.fullmatch(r"[A-Za-z]:", seg):
+            continue
+        seg = safe_segment(seg)
+        if seg:
+            parts.append(seg)
+    return parts[:MAX_DEPTH]
+
+
+def under(root, *parts):
+    """Join and prove the result really is inside root before we open it."""
+    target = (root / Path(*parts)).resolve() if parts else root.resolve()
+    if target != root.resolve() and not str(target).startswith(
+            str(root.resolve()) + os.sep):
+        raise ValueError("path escapes the destination")
+    return target
+
+
+# --------------------------------------------------------------------------
+# browser drops
+#
+# One dropped folder is hundreds of separate uploads, so the batch - not the
+# request - owns the destination: the folder is reserved once, up front, and
+# every file in it lands there even if a same-named folder already existed.
+# --------------------------------------------------------------------------
+
+DROPS = {}
+DROPS_LOCK = threading.Lock()
+DROP_TTL = 6 * 3600
+
+
+def open_drop(root_name, files, total):
+    now = time.time()
+    with DROPS_LOCK:
+        for key, old in list(DROPS.items()):
+            if now - old["seen"] > DROP_TTL:
+                DROPS.pop(key, None)
+        root = None
+        if root_name:
+            root = unique_path(DEST / root_name)
+            root.mkdir(parents=True, exist_ok=True)
+        drop_id = secrets.token_urlsafe(9)
+        DROPS[drop_id] = {"root": root, "files": max(int(files or 0), 0),
+                          "bytes": max(int(total or 0), 0), "done": 0,
+                          "recv": 0, "listed": 0, "mark": 0, "paths": {},
+                          "seen": now, "start": now}
+    return drop_id, root
+
+
+def close_drop(drop_id):
+    with DROPS_LOCK:
+        return DROPS.pop(drop_id, None)
+
+
 # --------------------------------------------------------------------------
 # receiver
 # --------------------------------------------------------------------------
 
 class Receiver(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "DropZone/1.0"
+    server_version = "easycp/1.0"
 
     def log_message(self, *args):
         pass  # we do our own logging
@@ -192,13 +297,21 @@ class Receiver(BaseHTTPRequestHandler):
         self.end_headers()
         return True
 
-    def _reply(self, code, body=b""):
+    def _reply(self, code, body=b"", ctype="text/plain"):
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; style-src 'unsafe-inline'; "
+                             "script-src 'unsafe-inline'; img-src 'self' data:")
         self.end_headers()
         if body:
             self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._reply(code, json.dumps(obj).encode(), "application/json")
 
     # -- receiving -------------------------------------------------------
     def _read_chunked(self, out):
@@ -235,15 +348,17 @@ class Receiver(BaseHTTPRequestHandler):
             total += len(chunk)
         return total
 
+    def _recv_into(self, f):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            return self._read_chunked(f)
+        return self._read_sized(f, int(self.headers.get("Content-Length", 0)))
+
     def _recv_body(self, dest_path):
         """Stream the request body to dest_path. Returns bytes written."""
         tmp = dest_path.with_name(dest_path.name + ".part")
         try:
             with open(tmp, "wb") as f:
-                if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
-                    n = self._read_chunked(f)
-                else:
-                    n = self._read_sized(f, int(self.headers.get("Content-Length", 0)))
+                n = self._recv_into(f)
             tmp.replace(dest_path)
             return n
         except Exception:
@@ -253,6 +368,9 @@ class Receiver(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self._authed():
             return self._reply(401, b"bad token\n")
+
+        if urlparse(self.path).path == "/drop/put":
+            return self._drop_put()
 
         DEST.mkdir(parents=True, exist_ok=True)
         name = safe_name(urlparse(self.path).path)
@@ -348,8 +466,157 @@ class Receiver(BaseHTTPRequestHandler):
             log(f"kept archive (extract failed: {e})")
             log_landed(archive)
 
+    # -- browser drops ---------------------------------------------------
+    def do_POST(self):
+        if not self._authed():
+            return self._reply(401, b"bad token\n")
+        path = urlparse(self.path).path
+        try:
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.loads(raw or b"{}")
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if path == "/drop/begin":
+            DEST.mkdir(parents=True, exist_ok=True)
+            root_parts = safe_rel(str(body.get("root") or ""))
+            root_name = root_parts[0] if root_parts else ""
+            count, size = body.get("files"), body.get("bytes")
+            try:
+                drop_id, root = open_drop(root_name, count, size)
+            except Exception as e:
+                log(f"FAILED starting a browser drop: {e}")
+                return self._reply(500, b"could not start\n")
+            what = f"{root.name}/" if root else plural(int(count or 0), "file")
+            log(f"browser drop starting: {what}  {human(int(size or 0))}")
+            return self._json({"id": drop_id,
+                               "root": root.name if root else ""})
+
+        if path == "/drop/end":
+            drop = close_drop(str(body.get("id") or ""))
+            if not drop:
+                return self._json({"ok": True})
+            secs = max(time.time() - drop["start"], 0.001)
+            root, done = drop["root"], drop["done"]
+            extra = done - drop["listed"]
+            if extra > 0:
+                log(f"   + ... and {extra} more files")
+            what = f"{root.name}/  {plural(done, 'file')}" if root \
+                else plural(done, "file")
+            log(f"copied  {what}  {human(drop['recv'])}  "
+                f"({human(drop['recv'] / secs)}/s)")
+            return self._json({"ok": True, "files": drop["done"],
+                               "bytes": drop["recv"]})
+
+        return self._reply(404, b"not here\n")
+
+    def _drop_put(self):
+        """One file, or one slice of one, from the drop page."""
+        with DROPS_LOCK:
+            drop = DROPS.get(self.headers.get("X-Drop", ""))
+            if drop:
+                drop["seen"] = time.time()
+        if not drop:
+            return self._reply(404, b"unknown drop - reload the page\n")
+
+        try:
+            raw = base64.urlsafe_b64decode(
+                self.headers.get("X-Path", "") + "===").decode("utf-8")
+        except Exception:
+            return self._reply(400, b"bad path\n")
+        parts = safe_rel(raw)
+        if not parts:
+            return self._reply(400, b"bad path\n")
+
+        idx = _int(self.headers.get("X-Part"), 0)
+        total = max(_int(self.headers.get("X-Parts"), 1), 1)
+        offset = _int(self.headers.get("X-Offset"), 0)
+        key = "/".join(parts)
+
+        if idx == 0:
+            try:
+                if drop["root"] is not None:
+                    # inside a folder we reserved, so the tree is kept verbatim
+                    target = under(drop["root"], *parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    target = unique_path(under(DEST, parts[-1]))
+            except ValueError:
+                log(f"REFUSED {raw}: path escapes {tilde(DEST)}")
+                return self._reply(400, b"bad path\n")
+            # later slices must reuse this exact name: a collision may have
+            # renamed it, and recomputing would send them to the wrong file
+            with DROPS_LOCK:
+                drop["paths"][key] = target
+        else:
+            with DROPS_LOCK:
+                target = drop["paths"].get(key)
+            if target is None:
+                return self._reply(409, b"start this file again from part 0\n")
+
+        tmp = target.with_name(target.name + ".part")
+        if idx == 0:
+            tmp.unlink(missing_ok=True)
+        have = tmp.stat().st_size if tmp.exists() else 0
+        if have != offset:
+            # a retried or out-of-order slice would silently corrupt the file
+            return self._reply(409, f"expected offset {have}\n".encode())
+
+        want = _int(self.headers.get("Content-Length"), -1)
+        try:
+            with open(tmp, "ab") as f:
+                n = self._recv_into(f)
+            # a dropped connection reads short rather than raising, and on the
+            # last slice that would rename a truncated file into place
+            if want >= 0 and n != want:
+                raise IOError(f"got {n} of {want} bytes")
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            log(f"FAILED {key}: {e}")
+            return self._reply(500, b"failed\n")
+
+        with DROPS_LOCK:
+            drop["recv"] += n
+        if idx + 1 < total:
+            return self._json({"ok": True, "offset": have + n})
+
+        tmp.replace(target)
+        size = target.stat().st_size
+        with DROPS_LOCK:
+            drop["done"] += 1
+            done, listed = drop["done"], drop["listed"]
+            # name the first few, then fall back to a percentage so a
+            # thousand-file folder does not bury the log
+            if listed < LIST_LIMIT:
+                drop["listed"] += 1
+                # name it as it landed - a collision may have renamed it
+                shown = "/".join(parts[:-1] + [target.name])
+                line = f"   + {shown}  {human(size)}"
+            elif drop["bytes"] and drop["recv"] * 4 // max(drop["bytes"], 1) > drop["mark"]:
+                drop["mark"] = drop["recv"] * 4 // max(drop["bytes"], 1)
+                line = (f"receiving ... {done}/{drop['files']} files  "
+                        f"{human(drop['recv'])} of {human(drop['bytes'])}")
+            else:
+                line = ""
+        if line:
+            log(line)
+        return self._json({"ok": True, "offset": size, "name": target.name})
+
     def do_GET(self):
-        self._reply(200, b"DropZone is listening.\n")
+        parsed = urlparse(self.path)
+        if parsed.path in ("/drop", "/drop/"):
+            key = parse_qs(parsed.query).get("k", [""])[0]
+            if not secrets.compare_digest(key, TOKEN):
+                return self._reply(403, b"bad or missing key\n")
+            return self._reply(200, DROP_PAGE.encode(), "text/html; charset=utf-8")
+        if parsed.path == "/drop/config":
+            if not self._authed():
+                return self._reply(401, b"bad token\n")
+            return self._json({"chunkMb": DROP_CHUNK_MB[0],
+                               "dest": DEST.name})
+        self._reply(200, b"easycp is listening.\n")
 
 
 # --------------------------------------------------------------------------
@@ -642,7 +909,7 @@ MODES = [
     {"id": "domain", "name": "My domain via Cloudflare",
      "note": "needs a Cloudflare account", "fields": ["hostname", "tunnel_name"],
      "hint": "Uses a domain already on your Cloudflare account. Log in once, "
-             "then DropZone creates the tunnel and the DNS record for you."},
+             "then easycp creates the tunnel and the DNS record for you."},
     {"id": "token", "name": "Cloudflare tunnel token",
      "note": "from the Zero Trust dashboard", "fields": ["hostname", "tunnel_token"],
      "hint": "Create the tunnel at one.dash.cloudflare.com (Networks > Tunnels), "
@@ -654,8 +921,8 @@ MODES = [
              "port-forward. No 100MB request cap."},
     {"id": "url", "name": "Custom URL",
      "note": "your own proxy or port-forward", "fields": ["url"],
-     "hint": "Already have DropZone reachable somewhere? Enter that base URL and "
-             "DropZone will just print the matching command."},
+     "hint": "Already have easycp reachable somewhere? Enter that base URL and "
+             "easycp will just print the matching command."},
 ]
 MODE_IDS = [m["id"] for m in MODES]
 FIELD_LABELS = {"hostname": "Hostname", "tunnel_name": "Tunnel name",
@@ -760,8 +1027,14 @@ class App:
     def snippet(self):
         return snippet(self.base, self.chunk, self.exclude)
 
+    def drop_url(self):
+        """The link you hand to whoever is sending - it carries the key, so
+        anyone holding it can upload until easycp restarts."""
+        return f"{self.base}/drop?k={TOKEN}"
+
     def as_dict(self):
         return {
+            "dropUrl": self.drop_url(),
             "modes": MODES, "fieldLabels": FIELD_LABELS, "mode": self.mode,
             "hostname": self.hostname, "tunnel_name": self.tunnel_name,
             "tunnel_token": self.tunnel_token, "url": self.url,
@@ -814,6 +1087,7 @@ class App:
             result = (False, self.status)
         finally:
             self.busy = False
+            DROP_CHUNK_MB[0] = self.chunk    # the drop page slices to match
             self.push()
         return result
 
@@ -842,7 +1116,7 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DropZone</title>
+<title>easycp</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M16 6v13m0 0l-5-5m5 5l5-5M8 25h16' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <style>
 :root{
@@ -868,7 +1142,13 @@ body{margin:0;background:var(--bg);color:var(--ink);
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;
   margin-bottom:20px;flex-wrap:wrap}
 h1{margin:0;font-size:26px;letter-spacing:-.02em}
-.tag{color:var(--mute);font-size:13px;margin-top:2px}
+/* the wordmark is art, so the real heading is left for screen readers only */
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+  white-space:nowrap}
+pre.mark{margin:0;color:var(--accent);font-family:ui-monospace,SFMono-Regular,
+  Menlo,Consolas,monospace;font-size:clamp(5px,1.55vw,11px);line-height:1.12;
+  font-weight:600}
+.tag{color:var(--mute);font-size:13px;margin-top:6px}
 .right{display:flex;align-items:center;gap:10px}
 .dest{color:var(--mute);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}
 
@@ -914,7 +1194,7 @@ input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--a
 .btn:hover{filter:brightness(1.07)} .btn:active{transform:translateY(1px)}
 .btn.ghost{background:var(--card);color:var(--ink);border-color:var(--line)}
 .btn.ghost:hover{background:var(--accent-soft)}
-.btn.ok{background:var(--good)}
+.btn.ok{background:var(--good);color:#fff;border-color:transparent}
 .btn[disabled]{opacity:.45;cursor:not-allowed;filter:none}
 
 .skip{display:flex;align-items:center;gap:11px;margin-bottom:12px;flex-wrap:wrap}
@@ -936,11 +1216,24 @@ pre.code{white-space:pre-wrap;word-break:break-all;max-height:190px;overflow:aut
 code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;padding:1px 6px;
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .err{background:var(--bad);color:#fff;padding:10px 14px;border-radius:9px;margin-bottom:14px}
+
+.wm{display:flex;align-items:center;gap:10px;justify-content:center;
+  margin-top:22px;padding-top:16px;border-top:1px solid var(--line);
+  font-size:12px;color:var(--faint)}
+.wm-mark{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;
+  letter-spacing:.04em;color:var(--mute)}
+.wm a{color:var(--faint);text-decoration:none}
+.wm a:hover{color:var(--accent);text-decoration:underline}
 </style></head><body>
 <div class="wrap">
   <header>
     <div>
-      <h1>DropZone</h1>
+      <h1 class="sr">easycp</h1>
+      <pre class="mark" aria-hidden="true">  ___   __ _  ___   _   _   ___  _ __
+ / _ \ / _` |/ __| | | | | / __|| '_ \
+|  __/| (_| |\__ \ | |_| || (__ | |_) |
+ \___| \__,_||___/  \__, | \___|| .__/
+                    |___/       |_|</pre>
       <div class="tag">one-paste file transfer off a remote box</div>
     </div>
     <div class="right">
@@ -950,7 +1243,7 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
     </div>
   </header>
 
-  <div id="offline" class="err" hidden>Lost the connection to DropZone. Is it still running?</div>
+  <div id="offline" class="err" hidden>Lost the connection to easycp. Is it still running?</div>
 
   <section class="card">
     <div class="chead">
@@ -982,12 +1275,30 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
   </section>
 
   <section class="card">
+    <div class="chead"><h2>EasyDrop &mdash; send from a browser</h2>
+      <span class="sub">for a Windows box, a phone, or anyone without a shell</span>
+    </div>
+    <pre class="code" id="dropurl"></pre>
+    <div class="foot">
+      <button class="btn ghost" id="copylink">Copy link</button>
+      <span class="meta">Anyone with this link can upload here until easycp
+        restarts, which issues a new key.</span>
+    </div>
+  </section>
+
+  <section class="card">
     <div class="chead"><span class="step">2</span><h2>Activity</h2>
       <span class="sub"><code class="k">peek /path</code> previews &middot;
         <code class="k">send /path</code> copies it here</span>
     </div>
     <div id="log"></div>
   </section>
+
+  <footer class="wm">
+    <span class="wm-mark">easycp</span>
+    <a href="https://github.com/roninimous/easycp" target="_blank"
+       rel="noopener noreferrer">github.com/roninimous/easycp</a>
+  </footer>
 </div>
 <script>
 const K = new URLSearchParams(location.search).get('k') || sessionStorage.getItem('dzk') || '';
@@ -1049,6 +1360,7 @@ function render(){
   $('#status').textContent = S.status;
   $('#dest').textContent = S.dest;
   $('#snippet').textContent = S.snippet;
+  $('#dropurl').textContent = S.dropUrl;
   $('#listening').textContent = 'listening on ' + S.base +
     (S.chunk ? '   ·   split into ' + S.chunk + 'MB requests' : '');
   if (document.activeElement !== $('#excl')) $('#excl').value = S.exclude;
@@ -1084,7 +1396,7 @@ $('#apply').onclick = () => {
 $('#login').onclick = () => api('/api/login', {}).catch(e => alert(e.message));
 $('#open').onclick = () => api('/api/open', {}).catch(e => alert(e.message));
 $('#quit').onclick = () => {
-  if (confirm('Stop DropZone? Transfers in progress will be cut off.'))
+  if (confirm('Stop easycp? Transfers in progress will be cut off.'))
     api('/api/quit', {}).catch(() => {});
 };
 
@@ -1095,8 +1407,7 @@ $('#excl').oninput = () => {
   exclTimer = setTimeout(() => api('/api/exclude', {exclude:v}).catch(()=>{}), 350);
 };
 
-$('#copy').onclick = async () => {
-  const btn = $('#copy'), text = S ? S.snippet : '';
+async function copyBtn(btn, text, label){
   try { await navigator.clipboard.writeText(text); }
   catch (e) {
     const ta = document.createElement('textarea');
@@ -1105,9 +1416,14 @@ $('#copy').onclick = async () => {
   }
   btn.textContent = '✓  Copied!'; btn.classList.add('ok');
   clearTimeout(btn._t);
-  btn._t = setTimeout(() => { btn.textContent = 'Copy command';
+  btn._t = setTimeout(() => { btn.textContent = label;
                               btn.classList.remove('ok'); }, 1600);
-};
+}
+
+$('#copy').onclick = () =>
+  copyBtn($('#copy'), S ? S.snippet : '', 'Copy command');
+$('#copylink').onclick = () =>
+  copyBtn($('#copylink'), S ? S.dropUrl : '', 'Copy link');
 
 function listen(){
   const es = new EventSource('/api/events?k=' + encodeURIComponent(K));
@@ -1143,6 +1459,415 @@ function listen(){
 
 
 # --------------------------------------------------------------------------
+# the drop page - served over the tunnel, this is what the sender sees
+# --------------------------------------------------------------------------
+
+DROP_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EasyDrop</title>
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M16 6v13m0 0l-5-5m5 5l5-5M8 25h16' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<style>
+:root{
+  --bg:#f4f6fb; --card:#fff; --line:#e3e8f0; --ink:#0f172a; --mute:#5b6577;
+  --faint:#94a0b3; --accent:#2563eb; --accent-ink:#fff; --accent-soft:#e8eefc;
+  --good:#059669; --bad:#dc2626; --track:#e8ecf4;
+  --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0a0f1d; --card:#121a2c; --line:#22304a; --ink:#e8edf7; --mute:#9aa8bf;
+    --faint:#6b7a93; --accent:#4f83f1; --accent-soft:#1a2743; --good:#34d399;
+    --bad:#f87171; --track:#1b2740; --shadow:none;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:34px 22px 48px}
+/* the wordmark is art, so the real heading is left for screen readers only */
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+  white-space:nowrap}
+pre.mark{margin:0;color:var(--accent);font-family:ui-monospace,SFMono-Regular,
+  Menlo,Consolas,monospace;font-size:clamp(4px,1.35vw,10px);line-height:1.12;
+  font-weight:600}
+.tag{color:var(--mute);font-size:13px;margin-top:8px}
+header{margin-bottom:20px}
+/* inline-block so the parent centres the art as one unit - centring a <pre>
+   line by line would stagger it */
+pre.target{display:inline-block;text-align:left;margin:0 0 14px;
+  color:var(--accent);line-height:1.18;font-weight:600;opacity:.85;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12px;transition:opacity .12s,transform .12s}
+#zone.over pre.target{opacity:1;transform:translateY(2px)}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:var(--shadow);padding:18px 20px;margin-bottom:14px}
+
+#zone{border:2px dashed var(--line);border-radius:var(--radius);background:var(--card);
+  padding:38px 22px;text-align:center;transition:border-color .12s,background .12s;
+  margin-bottom:14px}
+#zone.over{border-color:var(--accent);background:var(--accent-soft)}
+#zone .big{font-size:17px;font-weight:600;margin-bottom:4px}
+#zone .sub{color:var(--mute);font-size:13px}
+#zone svg{color:var(--accent);margin-bottom:10px}
+.picks{display:flex;gap:9px;justify-content:center;margin-top:16px;flex-wrap:wrap}
+
+.btn{border:1px solid transparent;border-radius:9px;padding:8px 16px;font:inherit;
+  font-size:13.5px;font-weight:550;cursor:pointer;background:var(--accent);
+  color:var(--accent-ink);transition:background .12s,transform .04s}
+.btn:hover{filter:brightness(1.07)} .btn:active{transform:translateY(1px)}
+.btn.ghost{background:var(--card);color:var(--ink);border-color:var(--line)}
+.btn.ghost:hover{background:var(--accent-soft)}
+.btn[disabled]{opacity:.45;cursor:not-allowed;filter:none}
+input[type=file]{display:none}
+
+.head{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.head h2{margin:0;font-size:15px;font-weight:600}
+.head .sub{color:var(--mute);font-size:12.5px;margin-left:auto}
+
+#rows{max-height:320px;overflow:auto;margin:0 -6px}
+.row{display:grid;grid-template-columns:1fr auto;gap:3px 12px;padding:7px 6px;
+  border-radius:8px;align-items:center}
+.row .nm{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:ui-monospace,Menlo,Consolas,monospace}
+.row .sz{color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums;
+  white-space:nowrap}
+.row .bar{grid-column:1/-1;height:4px;border-radius:3px;background:var(--track);
+  overflow:hidden}
+.row .bar i{display:block;height:100%;width:0;background:var(--accent);
+  transition:width .15s linear}
+.row.done .bar i{background:var(--good)}
+.row.bad .sz{color:var(--bad)} .row.bad .bar i{background:var(--bad)}
+
+.total{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+.total .bar{flex:1;min-width:160px;height:7px;border-radius:4px;background:var(--track);
+  overflow:hidden}
+.total .bar i{display:block;height:100%;width:0;background:var(--accent);
+  transition:width .15s linear}
+.total .txt{color:var(--mute);font-size:12.5px;font-variant-numeric:tabular-nums}
+.note{color:var(--faint);font-size:12.5px;margin-top:14px}
+.done-msg{background:var(--good);color:#fff;padding:11px 15px;border-radius:9px;
+  margin-bottom:14px;font-weight:550}
+.err{background:var(--bad);color:#fff;padding:11px 15px;border-radius:9px;
+  margin-bottom:14px}
+
+.wm{display:flex;align-items:center;gap:10px;justify-content:center;
+  margin-top:26px;padding-top:16px;border-top:1px solid var(--line);
+  font-size:12px;color:var(--faint)}
+.wm-mark{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;
+  letter-spacing:.04em;color:var(--mute)}
+.wm a{color:var(--faint);text-decoration:none}
+.wm a:hover{color:var(--accent);text-decoration:underline}
+[hidden]{display:none !important}
+</style></head><body>
+<div class="wrap">
+  <header>
+    <h1 class="sr">EasyDrop</h1>
+    <pre class="mark" aria-hidden="true"> _____                      ____
+| ____|  __ _  ___   _   _ |  _ \  _ __   ___   _ __
+|  _|   / _` |/ __| | | | || | | || '__| / _ \ | '_ \
+| |___ | (_| |\__ \ | |_| || |_| || |   | (_) || |_) |
+|_____| \__,_||___/  \__, ||____/ |_|    \___/ | .__/
+                     |___/                     |_|</pre>
+    <div class="tag">drop files here and they land on the other machine</div>
+  </header>
+
+  <div id="fail" class="err" hidden></div>
+  <div id="ok" class="done-msg" hidden></div>
+
+  <div id="zone">
+    <pre class="target" aria-hidden="true">       ___
+      |   |
+      |   |
+   ___|   |___
+   \         /
+    \       /
+     \     /
+      \___/
+
+|             |
+|             |
+|_____________|</pre>
+    <div class="big">Drop files or folders here</div>
+    <div class="sub">or pick them below &mdash; folders keep their structure</div>
+    <div class="picks">
+      <button class="btn" id="pickFiles">Choose files</button>
+      <button class="btn ghost" id="pickDir">Choose a folder</button>
+    </div>
+    <input type="file" id="fileIn" multiple>
+    <input type="file" id="dirIn" webkitdirectory directory multiple>
+  </div>
+
+  <section class="card" id="list" hidden>
+    <div class="head">
+      <h2 id="listTitle">Queue</h2>
+      <span class="sub" id="listSub"></span>
+    </div>
+    <div id="rows"></div>
+    <div class="total">
+      <div class="bar"><i id="allBar"></i></div>
+      <span class="txt" id="allTxt"></span>
+      <button class="btn ghost" id="cancel" hidden>Cancel</button>
+    </div>
+  </section>
+
+  <div class="note" id="note"></div>
+
+  <footer class="wm">
+    <span class="wm-mark">easycp</span>
+    <a href="https://github.com/roninimous/easycp" target="_blank"
+       rel="noopener noreferrer">github.com/roninimous/easycp</a>
+  </footer>
+</div>
+<script>
+const KEY = new URLSearchParams(location.search).get('k') || '';
+const $ = s => document.querySelector(s);
+const MB = 1024 * 1024;
+let CHUNK = 0;          // MB per request, 0 = send whole files
+let items = [], busy = false, cancelled = false, live = null;
+
+const human = n => {
+  const u = ['B','KB','MB','GB']; let i = 0;
+  while (n >= 1024 && i < 3) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : Math.round(n)) + u[i];
+};
+const b64 = s => btoa(String.fromCharCode.apply(null, new TextEncoder().encode(s)))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+fetch('/drop/config', {headers: {'X-Token': KEY}})
+  .then(r => r.ok ? r.json() : null)
+  .then(c => {
+    if (!c) return;
+    CHUNK = c.chunkMb || 0;
+    $('#note').textContent = 'Uploads land in the ' + c.dest +
+      ' folder on the receiving machine.' +
+      (CHUNK ? ' Large files are sent in ' + CHUNK + 'MB pieces.' : '');
+  })
+  .catch(() => {});
+
+/* ---- collecting ------------------------------------------------------- */
+// A dropped folder arrives as a tree of entries that has to be walked; the
+// items list must be read synchronously in the drop handler, before any await.
+async function walk(entry, prefix, out) {
+  if (entry.isFile) {
+    const f = await new Promise((res, rej) => entry.file(res, rej));
+    out.push({file: f, path: prefix + entry.name});
+  } else if (entry.isDirectory) {
+    const rd = entry.createReader();
+    for (;;) {
+      const batch = await new Promise((res, rej) => rd.readEntries(res, rej));
+      if (!batch.length) break;                 // readEntries caps at ~100
+      for (const e of batch) await walk(e, prefix + entry.name + '/', out);
+    }
+  }
+}
+
+const zone = $('#zone');
+['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, e => {
+  e.preventDefault(); zone.classList.add('over');
+}));
+['dragleave', 'drop'].forEach(ev => zone.addEventListener(ev, e => {
+  e.preventDefault();
+  if (ev === 'drop' || e.target === zone) zone.classList.remove('over');
+}));
+zone.addEventListener('drop', async e => {
+  const entries = [];
+  for (const it of e.dataTransfer.items || []) {
+    const en = it.webkitGetAsEntry && it.webkitGetAsEntry();
+    if (en) entries.push(en);
+  }
+  const out = [];
+  if (entries.length) {
+    for (const en of entries) await walk(en, '', out);
+  } else {
+    for (const f of e.dataTransfer.files || []) out.push({file: f, path: f.name});
+  }
+  add(out);
+});
+
+$('#pickFiles').onclick = () => $('#fileIn').click();
+$('#pickDir').onclick = () => $('#dirIn').click();
+$('#fileIn').onchange = e => add([...e.target.files].map(f => ({file: f, path: f.name})));
+$('#dirIn').onchange = e => add([...e.target.files].map(
+  f => ({file: f, path: f.webkitRelativePath || f.name})));
+
+/* ---- queue + rendering ------------------------------------------------ */
+function add(found) {
+  if (!found.length || busy) return;
+  $('#ok').hidden = true; $('#fail').hidden = true;
+  items = found.map(f => ({file: f.file, path: f.path, sent: 0, state: ''}));
+  $('#rows').textContent = '';
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = '<div class="nm"></div><div class="sz"></div>' +
+                    '<div class="bar"><i></i></div>';
+    row.querySelector('.nm').textContent = it.path;
+    row.querySelector('.sz').textContent = human(it.file.size);
+    it.row = row; it.fill = row.querySelector('.bar i');
+    it.note = row.querySelector('.sz');
+    $('#rows').append(row);
+  }
+  const bytes = items.reduce((n, i) => n + i.file.size, 0);
+  $('#list').hidden = false;
+  $('#listTitle').textContent = items.length + (items.length === 1 ? ' file' : ' files');
+  $('#listSub').textContent = human(bytes);
+  send();
+}
+
+let frame = null;
+function paint() {
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = null;
+    let sent = 0, total = 0;
+    for (const it of items) {
+      sent += it.sent; total += it.file.size;
+      const pct = it.file.size ? (it.sent / it.file.size) * 100 : (it.state ? 100 : 0);
+      it.fill.style.width = (it.state === 'done' ? 100 : pct) + '%';
+    }
+    $('#allBar').style.width = (total ? (sent / total) * 100 : 0) + '%';
+    const secs = (Date.now() - start) / 1000;
+    $('#allTxt').textContent = human(sent) + ' of ' + human(total) +
+      (busy && secs > 0.6 ? '  ·  ' + human(sent / secs) + '/s' : '');
+  });
+}
+
+/* ---- uploading -------------------------------------------------------- */
+let start = Date.now();
+
+function api(path, body) {
+  return fetch(path, {
+    method: 'POST',
+    headers: {'X-Token': KEY, 'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(r => {
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    return r.json();
+  });
+}
+
+function put(id, it, blob, part, parts, offset) {
+  return new Promise((res, rej) => {
+    const x = new XMLHttpRequest();
+    live = x;
+    x.open('PUT', '/drop/put');
+    x.setRequestHeader('X-Token', KEY);
+    x.setRequestHeader('X-Drop', id);
+    x.setRequestHeader('X-Path', b64(it.rel));
+    x.setRequestHeader('X-Part', part);
+    x.setRequestHeader('X-Parts', parts);
+    x.setRequestHeader('X-Offset', offset);
+    x.upload.onprogress = e => { it.sent = offset + e.loaded; paint(); };
+    x.onload = () => x.status === 200
+      ? res()
+      : rej(new Error(x.status + ' ' + (x.responseText || '').trim()));
+    x.onerror = () => rej(new Error('the connection dropped'));
+    x.onabort = () => rej(new Error('cancelled'));
+    x.send(blob);
+  });
+}
+
+async function putFile(id, it) {
+  const size = it.file.size, cut = CHUNK * MB;
+  const parts = (cut && size > cut) ? Math.ceil(size / cut) : 1;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      let off = 0;
+      for (let i = 0; i < parts; i++) {
+        if (cancelled) throw new Error('cancelled');
+        const blob = parts === 1 ? it.file : it.file.slice(off, Math.min(off + cut, size));
+        await put(id, it, blob, i, parts, off);
+        off += blob.size;
+        it.sent = off; paint();
+      }
+      return;
+    } catch (e) {
+      // a failed slice leaves a half-written part, so retry the whole file:
+      // part 0 is what tells the receiver to start the file over
+      if (cancelled || attempt >= 2) throw e;
+      it.sent = 0; it.note.textContent = 'retrying ...'; paint();
+      await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+    }
+  }
+}
+
+// Each top-level folder is its own batch, so the receiver can reserve one
+// destination for it up front; everything loose goes in a batch together.
+function batches() {
+  const byRoot = new Map(), loose = [];
+  for (const it of items) {
+    const cut = it.path.indexOf('/');
+    if (cut > 0) {
+      const root = it.path.slice(0, cut);
+      it.rel = it.path.slice(cut + 1);
+      if (!byRoot.has(root)) byRoot.set(root, []);
+      byRoot.get(root).push(it);
+    } else {
+      it.rel = it.path;
+      loose.push(it);
+    }
+  }
+  const out = [...byRoot].map(([root, list]) => ({root, list}));
+  if (loose.length) out.push({root: '', list: loose});
+  return out;
+}
+
+async function send() {
+  busy = true; cancelled = false; start = Date.now();
+  $('#cancel').hidden = false;
+  let files = 0, bytes = 0;
+  try {
+    for (const b of batches()) {
+      const size = b.list.reduce((n, i) => n + i.file.size, 0);
+      const {id} = await api('/drop/begin',
+                             {root: b.root, files: b.list.length, bytes: size});
+      try {
+        for (const it of b.list) {
+          await putFile(id, it);
+          it.state = 'done'; it.row.classList.add('done');
+          it.note.textContent = human(it.file.size);
+          files++; bytes += it.file.size;
+          paint();
+        }
+      } finally {
+        await api('/drop/end', {id}).catch(() => {});
+      }
+    }
+    $('#ok').hidden = false;
+    $('#ok').textContent = 'Sent ' + files + (files === 1 ? ' file' : ' files') +
+                           '  ·  ' + human(bytes);
+  } catch (e) {
+    const it = items.find(i => i.state !== 'done');
+    if (it) { it.row.classList.add('bad'); it.note.textContent = 'failed'; }
+    $('#fail').hidden = false;
+    $('#fail').textContent = cancelled
+      ? 'Cancelled. ' + files + ' of ' + items.length + ' files had already been sent.'
+      : 'Upload stopped: ' + e.message + ' — ' + files + ' of ' + items.length +
+        ' files got through. Try the rest again.';
+  } finally {
+    busy = false; live = null;
+    $('#cancel').hidden = true;
+    paint();
+  }
+}
+
+$('#cancel').onclick = () => {
+  cancelled = true;
+  if (live) live.abort();
+};
+window.addEventListener('beforeunload', e => {
+  if (busy) { e.preventDefault(); e.returnValue = ''; }
+});
+</script></body></html>
+"""
+
+
+# --------------------------------------------------------------------------
 # control server - local only, this is what the browser talks to
 # --------------------------------------------------------------------------
 
@@ -1152,7 +1877,7 @@ LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 class Control(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "DropZone-UI/1.0"
+    server_version = "easycp-UI/1.0"
     app = None                      # set once, before the server starts
 
     def log_message(self, *args):
@@ -1329,11 +2054,15 @@ def copy_to_clipboard(text):
     else:
         tries = [["wl-copy"], ["xclip", "-selection", "clipboard"],
                  ["xsel", "--clipboard", "--input"]]
+    # clip.exe decodes stdin with the console code page unless it sees a
+    # UTF-16LE BOM, which would mangle a non-ASCII exclude pattern. The
+    # utf-16 codec writes that BOM for us; Windows is always little-endian.
+    data = text.encode("utf-16" if os.name == "nt" else "utf-8")
     for cmd in tries:
         if not shutil.which(cmd[0]):
             continue
         try:
-            subprocess.run(cmd, input=text.encode(), check=True)
+            subprocess.run(cmd, input=data, check=True)
             return True
         except Exception:
             pass
@@ -1345,6 +2074,8 @@ HELP = """
 
     show                  print the paste-me command again
     copy                  copy it to the clipboard
+    link                  print the browser upload link (no shell needed)
+    copylink              copy that link instead
     status                where files land, what is listening, what is skipped
     log [n]               replay the last n log lines (default 20)
 
@@ -1359,12 +2090,23 @@ HELP = """
 
     dest [path]           show or change where files land
     open                  open that folder in the file manager
-    quit                  stop DropZone
+    quit                  stop easycp
 """ % " | ".join(MODE_IDS)
 
 
+REPO = "github.com/roninimous/easycp"
+
+LOGO = r"""
+    ___   __ _  ___   _   _   ___  _ __
+   / _ \ / _` |/ __| | | | | / __|| '_ \
+  |  __/| (_| |\__ \ | |_| || (__ | |_) |
+   \___| \__,_||___/  \__, | \___|| .__/
+                      |___/       |_|
+"""
+
+
 def banner(app):
-    out = ["", paint("  DropZone", BOLD)]
+    out = [paint(LOGO, BOLD)]
     out.append(f"  saving to   {tilde(DEST)}")
     out.append(f"  listening   {app.base}")
     if app.chunk:
@@ -1378,7 +2120,12 @@ def banner(app):
     out.append("  2. then:  " + paint("peek /path", BOLD) + "  to preview,  "
                + paint("send /path", BOLD) + "  to copy it here")
     out.append("")
+    out.append("  no shell on the other end? send them this link instead:")
+    out.append("")
+    out.append("     " + app.drop_url())
+    out.append("")
     out.append(paint("  type `help` for commands, `quit` to stop", DIM))
+    out.append(paint(f"  {REPO}", DIM))
     out.append("")
     return "\n".join(out)
 
@@ -1410,9 +2157,18 @@ def repl(app):
             else:
                 print("  no clipboard tool found - here it is:\n")
                 print("     " + app.snippet() + "\n")
+        elif cmd == "link":
+            print("\n     " + app.drop_url() + "\n")
+        elif cmd == "copylink":
+            if copy_to_clipboard(app.drop_url()):
+                print("  copied to the clipboard")
+            else:
+                print("  no clipboard tool found - here it is:\n")
+                print("     " + app.drop_url() + "\n")
         elif cmd in ("status", "st"):
             print(f"  mode        {mode_info(app.mode)['name']}")
             print(f"  listening   {app.base}   ({app.status})")
+            print(f"  drop page   {app.drop_url()}")
             print(f"  saving to   {tilde(DEST)}")
             print(f"  splitting   {str(app.chunk) + 'MB per request' if app.chunk else 'off'}")
             print(f"  skipping    {app.exclude or '(nothing)'}")
@@ -1531,7 +2287,7 @@ def main():
         srv = ThreadingHTTPServer(("0.0.0.0", args.port), Receiver)
     except OSError as e:
         sys.exit(f"cannot listen on port {args.port}: {e}\n"
-                 f"another DropZone may already be running - try --port {args.port + 1}")
+                 f"another easycp may already be running - try --port {args.port + 1}")
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -1570,9 +2326,12 @@ def main():
     ui_port = start_control(app, args.ui_port)
     ui_url = f"http://127.0.0.1:{ui_port}/?k={UI_TOKEN}"
     print()
-    print(paint("  DropZone", BOLD) + f"  -  control panel at {ui_url}")
+    print(paint(LOGO, BOLD))
+    print(f"  control panel at {ui_url}")
+    print(paint(f"  {REPO}", DIM))
     print(f"  saving to   {tilde(DEST)}")
     print(f"  listening   {app.base}")
+    print(f"  drop page   {app.drop_url()}")
     print(paint("  ctrl-c here, or Quit in the browser, to stop", DIM))
     print()
     if not args.no_browser:
