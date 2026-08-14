@@ -2933,6 +2933,7 @@ HELP = """
 
     dest [path]           show or change where files land
     open                  open that folder in the file manager
+    logo [path]           show, set, or `logo remove` the drop-page logo
     quit                  stop easycp
 """ % " | ".join(MODE_IDS)
 
@@ -3116,6 +3117,24 @@ def repl(app):
         elif cmd == "open":
             open_folder(DEST)
             print(f"  opened {tilde(DEST)}")
+        elif cmd == "logo":
+            if rest.lower() in ("remove", "clear", "off"):
+                clear_logo()
+                app.push()
+                print("  logo removed")
+            elif rest:
+                try:
+                    data = Path(rest).expanduser().read_bytes()
+                except OSError as e:
+                    print(f"  could not read {rest}: {e}")
+                else:
+                    ok, msg = set_logo(data)
+                    if ok:
+                        app.push()
+                    print(("  " if ok else "  error: ") + msg)
+            else:
+                print(f"  logo: {'set' if LOGO['data'] else '(none)'}"
+                      "   usage: logo <path>  |  logo remove")
         else:
             print(f"  no such command: {cmd}   (try `help`)")
 
@@ -3165,7 +3184,26 @@ def main():
                     help="port for the local browser UI (default: pick a free one)")
     ap.add_argument("--no-browser", action="store_true",
                     help="start the browser UI but do not open a window")
+    ap.add_argument("--set-logo", metavar="PATH",
+                    help="set the drop-page logo from an image file, then exit")
+    ap.add_argument("--remove-logo", action="store_true",
+                    help="remove the current logo, then exit")
     args = ap.parse_args()
+
+    if args.set_logo:
+        try:
+            data = Path(args.set_logo).expanduser().read_bytes()
+        except OSError as e:
+            sys.exit(f"could not read {args.set_logo}: {e}")
+        ok, msg = set_logo(data)
+        if not ok:
+            sys.exit(f"  {msg}")
+        print(f"  {msg}")
+        return
+    if args.remove_logo:
+        clear_logo()
+        print("  logo removed")
+        return
 
     DEST = Path(args.dest).expanduser()
     AUTO_EXTRACT = not args.no_extract

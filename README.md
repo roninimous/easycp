@@ -236,6 +236,11 @@ survives restarts; **Remove** takes it off again. The file is served from the
 same key-protected URL as the page, so it is no more public than the link
 itself.
 
+No browser handy (headless, over SSH)? `--set-logo PATH` and `--remove-logo`
+do the same thing from the command line; each runs as a one-off and exits
+without starting the server. Already running with `--headless`? `logo <path>`
+and `logo remove` at the prompt do it live, no restart needed.
+
 Pick something that reads on both a light and a dark background — the page
 follows the viewer's system theme, and dark lettering on a transparent
 background disappears in dark mode. SVG is deliberately not accepted: it is
@@ -378,11 +383,15 @@ python3 easycp.py [options]
   --headless            drive everything from the terminal, no browser UI
   --ui-port PORT        port for the local control panel (default: a free one)
   --no-browser          serve the control panel but do not open a window
+  --set-logo PATH       set the drop-page logo from an image file, then exit
+  --remove-logo         remove the current logo, then exit
 ```
 
 ```bash
 python3 easycp.py --tunnel domain --hostname drop.example.com
 python3 easycp.py --headless --tunnel off
+python3 easycp.py --set-logo ~/Pictures/logo.png
+python3 easycp.py --remove-logo
 ```
 
 ## How it works
