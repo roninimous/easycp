@@ -1356,38 +1356,105 @@ def snippet(base_url, chunk_mb=0, excludes=DEFAULT_EXCLUDE):
     # $(_dzx) is deliberately unquoted so each pattern becomes its own word.
     # The inner $(printf ...) is what forces that split under zsh too, which
     # does not split a bare $VAR - there the excludes would silently do nothing.
+    # _dzr resolves a path to an absolute one, so that `.` and `..` arrive
+    # with a real name: basename "." is "." and would have travelled as an
+    # archive called ".tgz". It also answers "does this exist" in one step.
+    #
+    # _dzls lists the top-level entries of a directory by kind, hidden ones
+    # included - which is the whole point of -af/-ad over a bare *, since the
+    # shell expands * before we ever see it and * never matches a dotfile.
+    #
+    # _dzm expands a wildcard argument if the user's shell left it literal
+    # (for example under noglob). Normal shell expansion still wins first.
     prelude = (
         f'DZ_EXCLUDE="${{DZ_EXCLUDE-{excludes}}}"; '
         '_dzx() { for x in $(printf "%s\\n" "$DZ_EXCLUDE"); do '
         'printf " --exclude=%s" "$x"; done; }; '
+        '_dzr() { if [ -d "$1" ]; then (cd "$1" && pwd); '
+        'elif [ -e "$1" ]; then printf "%s/%s" '
+        '"$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; fi; }; '
+        '_dzm() { case "$1" in *\\**|*\\?*|*\\[*) '
+        'd=$(dirname "$1"); b=$(basename "$1"); '
+        '[ "$b" = "*" ] && return 0; '
+        '( cd "$d" 2>/dev/null || exit 1; '
+        'if [ -n "$ZSH_VERSION" ]; then setopt null_glob; fi; '
+        'for e in * .*; do case "$e" in .|..) continue;; esac; '
+        '[ -e "$e" ] || continue; '
+        'case "$b:$e" in .*:*) ;; *:.*) continue;; esac; '
+        'if [ -n "$ZSH_VERSION" ]; then [[ "$e" = ${~b} ]] || continue; '
+        'else case "$e" in $b) ;; *) continue;; esac; fi; '
+        'printf "%s/%s\\n" "$(pwd)" "$e"; done ); '
+        ';; *) _dzr "$1";; esac; }; '
+        '_dzls() { k=$1; ( cd "$2" || exit 1; '
+        'if [ -n "$ZSH_VERSION" ]; then setopt null_glob; fi; '
+        'for e in * .*; do case "$e" in .|..) continue;; esac; '
+        '[ -e "$e" ] || continue; '
+        'case "$k" in f) [ -f "$e" ] || continue;; d) [ -d "$e" ] || continue;; '
+        'esac; printf "%s\\n" "$e"; done ); }; '
+        # every flag resolves to a kind, so peek and send parse them the same way
+        '_dzk() { case "$1" in -a|-all) echo all;; -af|-allfiles) echo f;; '
+        '-ad|-alldirs|-alldirectories) echo d;; esac; }; '
+    )
+
+    # "${@:-.}" makes a bare `peek` or `send` mean "this directory", which is
+    # what you want after cd-ing somewhere.
+    guard = (
+        'q=$(_dzr "$p"); '
+        'if [ -z "$q" ]; then echo "no such path: $p"; continue; fi; '
+        'if [ "$q" = / ]; then echo "refusing to take the whole filesystem"; '
+        'continue; fi; b=$(basename "$q"); d=$(dirname "$q"); '
+    )
+
+    # the flag forms pack once, from a list, instead of once per argument
+    flag_pack = (
+        'p=${2:-.}; q=$(_dzr "$p"); '
+        'if [ -z "$q" ]; then echo "no such path: $p"; return 1; fi; '
+        'b=$(basename "$q"); l=$(mktemp); _dzls "$k" "$q" > "$l"; '
+        'if [ ! -s "$l" ]; then rm -f "$l"; '
+        'echo "nothing matching in $q"; return 1; fi; '
+    )
+    flag_tar = (
+        'COPYFILE_DISABLE=1 tar -C "$q" $(_dzx) -czf %s -T "$l"'
     )
 
     peek = (
-        'peek() { for p in "$@"; do b=$(basename "$p"); d=$(dirname "$p"); '
-        't=$(mktemp); tar -C "$d" $(_dzx) -czf "$t" "$b"; echo "== $p"; '
+        'peek() { k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
+        't=$(mktemp); ' + (flag_tar % '"$t"') + '; '
+        'echo "== $q"; tar -tzf "$t" | sed "s/^/   /" | head -30; '
+        'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
+        '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
+        'rm -f "$t" "$l"; return; fi; '
+        'for p in "${@:-.}"; do m=$(_dzm "$p"); '
+        'if [ -z "$m" ]; then echo "no such path: $p"; continue; fi; '
+        'printf "%s\\n" "$m" | while IFS= read -r p; do ' + guard +
+        't=$(mktemp); COPYFILE_DISABLE=1 tar -C "$d" $(_dzx) -czf "$t" "$b"; echo "== $q"; '
         'tar -tzf "$t" | sed "s/^/   /" | head -30; '
         'echo "   ---- $(tar -tzf "$t" | wc -l | tr -d " ") entries, '
         '$(wc -c < "$t" | awk \'{printf "%.2f MB", $1/1048576}\') gzipped"; '
-        'rm -f "$t"; done; }; '
+        'rm -f "$t"; done; done; }; '
     )
 
     if not chunk_mb:
-        send = (
-            'send() { for p in "$@"; do b=$(basename "$p"); '
-            'tar -C "$(dirname "$p")" $(_dzx) -czf - "$b" | '
-            f'curl -f#T - -H "X-Token: {TOKEN}" "{base_url}/u/$b.tgz"; done; }}'
-        )
+        up = (f'_dzup() {{ curl -f#T - -H "X-Token: {TOKEN}" '
+              f'"{base_url}/u/$1.tgz"; }}; ')
     else:
-        send = (
-            'send() { for p in "$@"; do b=$(basename "$p"); d=$(mktemp -d); '
-            f'tar -C "$(dirname "$p")" $(_dzx) -czf - "$b" | '
-            f'split -b {chunk_mb}m -d -a 3 - "$d/p"; '
-            'n=$(ls "$d" | wc -l); i=0; for f in "$d"/p*; do '
-            f'curl -f#T "$f" -H "X-Token: {TOKEN}" -H "X-Parts: $n" '
-            f'"{base_url}/u/$b.tgz.p$(printf %03d $i)" || break; i=$((i+1)); done; '
-            'rm -rf "$d"; done; }'
-        )
-    return prelude + peek + send
+        up = ('_dzup() { w=$(mktemp -d); '
+              f'split -b {chunk_mb}m -d -a 3 - "$w/p"; '
+              'n=$(ls "$w" | wc -l); i=0; for f in "$w"/p*; do '
+              f'curl -f#T "$f" -H "X-Token: {TOKEN}" -H "X-Parts: $n" '
+              f'"{base_url}/u/$1.tgz.p$(printf %03d $i)" || break; '
+              'i=$((i+1)); done; rm -rf "$w"; }; ')
+
+    send = (
+        'send() { k=$(_dzk "$1"); if [ -n "$k" ]; then ' + flag_pack +
+        (flag_tar % "-") + ' | _dzup "$b"; rm -f "$l"; return; fi; '
+        'for p in "${@:-.}"; do m=$(_dzm "$p"); '
+        'if [ -z "$m" ]; then echo "no such path: $p"; continue; fi; '
+        'printf "%s\\n" "$m" | while IFS= read -r p; do ' + guard +
+        'COPYFILE_DISABLE=1 tar -C "$d" $(_dzx) -czf - "$b" | _dzup "$b"; '
+        'done; done; }'
+    )
+    return prelude + up + peek + send
 
 
 def chunk_for(mode, base, override="auto"):

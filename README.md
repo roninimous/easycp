@@ -110,6 +110,44 @@ Files arrive in `~/EasyDrop`, and every file that lands is named in the
 activity log. `send` takes several paths at once:
 `send /etc/nginx/nginx.conf /var/log/app.log`.
 
+Paths can be relative, and with no argument at all both commands mean *this
+directory*, which is usually what you want after `cd`-ing somewhere:
+
+```bash
+cd /var/www/html
+peek            # lists this directory
+send            # sends all of it, keeping the directory's own name
+send -a         # sends all top-level files and directories loose
+send -af        # sends only top-level files
+send -ad        # sends only top-level directories
+send src ../notes.md
+```
+
+The long forms are `send -all`, `send -allfiles` and
+`send -alldirectories`. They also work with `peek`.
+
+Wildcards still work for suffix-style selections such as `send *.png`,
+`send *.pdf` or `send *LOGO.png`. If your shell leaves that pattern literal,
+`send` expands it against the current directory. Do not use `send *` as the
+"everything" form; use `send -a` instead.
+
+`send -a` and `send .` are not the same thing:
+
+| | `send -a` | `send .` |
+|---|---|---|
+| hidden files (`.htaccess`, `.config`) | included | included |
+| arrives as | the contents, loose | one folder, named after the directory |
+| uploads | one archive | one archive |
+
+The shell expands `*` before `send` sees anything, and `*` does not match
+dotfiles — so a web root sent that way quietly arrives without its
+`.htaccess`. Either way `.git`, `node_modules` and `.env` are still skipped.
+
+`.` and `..` resolve to their real names before anything is packed, so the
+folder arrives called what it is rather than `.tgz`. A path that does not
+exist says so — including a wildcard that matched nothing — instead of sending
+an empty archive, and `send /` is refused.
+
 ## EasyDrop — for whoever has no shell
 
 ```
