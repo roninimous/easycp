@@ -18,13 +18,13 @@ VPS shell, and then:
 send /var/www/html
 ```
 
-The folder lands in `~/DropZone`, unpacked and ready.
+The folder lands in `~/EasyDrop`, unpacked and ready.
 
 ```
    your laptop                                     the VPS
 ┌──────────────────┐                        ┌────────────────────┐
 │  easycp.py       │   <—— HTTPS PUT ——     │  send /var/www/html│
-│  ~/DropZone/     │      (outbound)        │  tar → curl        │
+│  ~/EasyDrop/     │      (outbound)        │  tar → curl        │
 └──────────────────┘                        └────────────────────┘
 ```
 
@@ -106,7 +106,7 @@ peek /var/www/html      # lists what would go, uploads nothing
 send /var/www/html      # actually transfers it
 ```
 
-Files arrive in `~/DropZone`, and every file that lands is named in the
+Files arrive in `~/EasyDrop`, and every file that lands is named in the
 activity log. `send` takes several paths at once:
 `send /etc/nginx/nginx.conf /var/log/app.log`.
 
@@ -132,7 +132,7 @@ https://your-tunnel.trycloudflare.com/drop?k=<key>
 **Copy link** in the control panel, or `link` / `copylink` at the prompt. Send
 it to whoever is holding the files; they open it in any browser and drag files
 or whole folders onto the page. Folders keep their structure, progress is shown
-per file, and everything lands in `~/DropZone` exactly as `send` would deliver
+per file, and everything lands in `~/EasyDrop` exactly as `send` would deliver
 it. Nothing to install on their side — it works from Windows, a phone, or a
 locked-down machine.
 
@@ -144,6 +144,23 @@ with transfer speed" width="700">
 
 The link carries the key, so treat it like a password: anyone who has it can
 upload to your machine until easycp restarts and issues a new one.
+
+### Put your logo on it
+
+A stranger opening a random tunnel URL has no idea whose machine is on the
+other end. Under the EasyDrop link in the control panel, **Choose image** picks
+a logo; it then sits beside the wordmark both in the panel and at the top right
+of the page you send out, so the sender can see who they are sending to.
+
+PNG, JPEG, GIF or WebP, up to 2MB. It is stored at `~/.easycp-logo` and
+survives restarts; **Remove** takes it off again. The file is served from the
+same key-protected URL as the page, so it is no more public than the link
+itself.
+
+Pick something that reads on both a light and a dark background — the page
+follows the viewer's system theme, and dark lettering on a transparent
+background disappears in dark mode. SVG is deliberately not accepted: it is
+markup rather than an image, and nothing here needs it.
 
 ## The two front ends
 
@@ -232,7 +249,7 @@ gzipped upload size without sending a byte.
 python3 easycp.py [options]
 
   --port PORT           listen port (default 8765)
-  --dest DEST           where received files land (default ~/DropZone)
+  --dest DEST           where received files land (default ~/EasyDrop)
   --tunnel MODE         auto | quick | domain | token | off
   --hostname HOST       your domain, e.g. drop.example.com
   --tunnel-name NAME    cloudflared tunnel name (default "dropzone")
@@ -302,6 +319,10 @@ the file.
 - A long transfer dies with its SSH session. Use `tmux` for big ones.
 - Killing easycp with `SIGTERM` (e.g. `pkill`) orphans its `cloudflared`
   child; Ctrl-C, `quit`, and the panel's Quit button shut it down properly.
+- Files used to land in `~/DropZone`. On first run the old folder is renamed to
+  `~/EasyDrop`, so nothing is left behind — unless `~/EasyDrop` already exists,
+  in which case both are kept and the log says so. Settings still live in
+  `~/.dropzone.json`; renaming that would drop your saved tunnel config.
 
 ## License
 

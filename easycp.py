@@ -10,7 +10,7 @@ shell snippet. Paste that snippet into any VPS shell, then run:
     send /var/www/html
     send /etc/nginx/nginx.conf notes.txt
 
-...and the files land in your DropZone folder. No SSH keys, no scp syntax.
+...and the files land in your EasyDrop folder. No SSH keys, no scp syntax.
 
 There are two front ends over the same engine, and no GUI toolkit in either:
 
@@ -63,7 +63,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 # --------------------------------------------------------------------------
 
 TOKEN = secrets.token_urlsafe(9)
-DEST = Path.home() / "DropZone"
+DEST = Path.home() / "EasyDrop"
 AUTO_EXTRACT = True
 LOG_SINKS = []          # callables(str)
 LOG_HISTORY = []        # replayed into the GUI, which attaches its sink late
@@ -105,7 +105,7 @@ def human(n):
 
 
 def tilde(path):
-    """~/DropZone/foo reads better in a log than /Users/someone/DropZone/foo."""
+    """~/EasyDrop/foo reads better in a log than /Users/someone/EasyDrop/foo."""
     try:
         return "~/" + str(Path(path).relative_to(Path.home()))
     except ValueError:
@@ -113,7 +113,7 @@ def tilde(path):
 
 
 def in_dest(path):
-    """Log paths as the user thinks of them: relative to the DropZone folder."""
+    """Log paths as the user thinks of them: relative to the EasyDrop folder."""
     try:
         return str(Path(path).relative_to(DEST))
     except ValueError:
@@ -169,6 +169,90 @@ def save_config(cfg):
         os.chmod(CONFIG_PATH, 0o600)
     except Exception as e:
         log(f"could not save settings: {e}")
+
+
+# --------------------------------------------------------------------------
+# the logo - optional branding shown in the panel and on the drop page
+# --------------------------------------------------------------------------
+
+LOGO_PATH = Path.home() / ".easycp-logo"
+LOGO_MAX = 2 * 1024 * 1024
+LOGO = {"data": b"", "type": "", "v": 0}
+
+
+def sniff_image(data):
+    """Trust the bytes, not the Content-Type the browser claimed.
+
+    SVG is deliberately not accepted: it is markup, it would be served from
+    the same origin as the drop page, and nothing here needs it.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def load_logo():
+    try:
+        data = LOGO_PATH.read_bytes()
+    except OSError:
+        return
+    kind = sniff_image(data)
+    if kind:
+        LOGO.update(data=data, type=kind, v=int(LOGO_PATH.stat().st_mtime))
+    else:
+        log(f"ignoring {tilde(LOGO_PATH)}: not a PNG, JPEG, GIF or WebP")
+
+
+def set_logo(data):
+    """Returns (ok, message). Raises nothing - the caller replies with it."""
+    if not data:
+        return False, "empty upload"
+    if len(data) > LOGO_MAX:
+        return False, f"too big - keep it under {human(LOGO_MAX)}"
+    kind = sniff_image(data)
+    if not kind:
+        return False, "needs to be a PNG, JPEG, GIF or WebP"
+    try:
+        LOGO_PATH.write_bytes(data)
+        os.chmod(LOGO_PATH, 0o600)
+    except OSError as e:
+        return False, f"could not save it: {e}"
+    LOGO.update(data=data, type=kind, v=int(time.time()))
+    log(f"logo set  {kind}  {human(len(data))}")
+    return True, "logo updated"
+
+
+def clear_logo():
+    LOGO_PATH.unlink(missing_ok=True)
+    LOGO.update(data=b"", type="", v=int(time.time()))
+    log("logo removed")
+
+
+OLD_DEST = Path.home() / "DropZone"
+
+
+def adopt_old_dest(dest):
+    """~/DropZone was the default before the rename, so carry it across rather
+    than silently starting an empty folder next to the user's files."""
+    if dest != Path.home() / "EasyDrop" or not OLD_DEST.is_dir():
+        return dest            # a custom --dest, or nothing to carry over
+    if dest.exists():
+        if any(OLD_DEST.iterdir()):
+            log(f"note: {tilde(OLD_DEST)} still holds files - "
+                f"now saving to {tilde(dest)}")
+        return dest
+    try:
+        OLD_DEST.rename(dest)
+        log(f"moved {tilde(OLD_DEST)} -> {tilde(dest)}")
+    except OSError as e:
+        log(f"could not move {tilde(OLD_DEST)} ({e}) - saving to {tilde(dest)}")
+    return dest
 
 
 def unique_path(base):
@@ -312,6 +396,17 @@ class Receiver(BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._reply(code, json.dumps(obj).encode(), "application/json")
+
+    def _image(self, data, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        # user-supplied bytes: never let a browser guess a different type
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'")
+        self.end_headers()
+        self.wfile.write(data)
 
     # -- receiving -------------------------------------------------------
     def _read_chunked(self, out):
@@ -611,11 +706,21 @@ class Receiver(BaseHTTPRequestHandler):
             if not secrets.compare_digest(key, TOKEN):
                 return self._reply(403, b"bad or missing key\n")
             return self._reply(200, DROP_PAGE.encode(), "text/html; charset=utf-8")
+        if parsed.path == "/drop/logo":
+            # an <img> cannot send a header, so this one takes the key in the
+            # query like the page itself does
+            key = parse_qs(parsed.query).get("k", [""])[0]
+            if not secrets.compare_digest(key, TOKEN):
+                return self._reply(403, b"bad or missing key\n")
+            if not LOGO["data"]:
+                return self._reply(404, b"no logo\n")
+            return self._image(LOGO["data"], LOGO["type"])
         if parsed.path == "/drop/config":
             if not self._authed():
                 return self._reply(401, b"bad token\n")
             return self._json({"chunkMb": DROP_CHUNK_MB[0],
-                               "dest": DEST.name})
+                               "dest": DEST.name,
+                               "logo": bool(LOGO["data"]), "logoV": LOGO["v"]})
         self._reply(200, b"easycp is listening.\n")
 
 
@@ -1038,6 +1143,7 @@ class App:
     def as_dict(self):
         return {
             "dropUrl": self.drop_url(),
+            "logo": bool(LOGO["data"]), "logoV": LOGO["v"],
             "modes": MODES, "fieldLabels": FIELD_LABELS, "mode": self.mode,
             "hostname": self.hostname, "tunnel_name": self.tunnel_name,
             "tunnel_token": self.tunnel_token, "url": self.url,
@@ -1220,6 +1326,15 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .err{background:var(--bad);color:#fff;padding:10px 14px;border-radius:9px;margin-bottom:14px}
 
+.brandlogo{max-height:34px;max-width:150px;object-fit:contain}
+.brandlogo.big{max-height:46px;max-width:170px}
+.brandrow{display:flex;align-items:center;gap:14px;margin-top:16px;
+  padding-top:15px;border-top:1px solid var(--line);flex-wrap:wrap}
+.brandtext{flex:1;min-width:170px}
+.brandtitle{font-weight:600;font-size:13.5px}
+.brandbtns{display:flex;gap:8px;flex-wrap:wrap}
+input[type=file]{display:none}
+
 .wm{display:flex;align-items:center;gap:10px;justify-content:center;
   margin-top:22px;padding-top:16px;border-top:1px solid var(--line);
   font-size:12px;color:var(--faint)}
@@ -1240,6 +1355,7 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
       <div class="tag">one-paste file transfer off a remote box</div>
     </div>
     <div class="right">
+      <img class="brandlogo" id="logo" alt="" hidden>
       <span class="dest" id="dest"></span>
       <button class="btn ghost" id="open">Open folder</button>
       <button class="btn ghost" id="quit">Quit</button>
@@ -1286,6 +1402,19 @@ code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;paddi
       <button class="btn ghost" id="copylink">Copy link</button>
       <span class="meta">Anyone with this link can upload here until easycp
         restarts, which issues a new key.</span>
+    </div>
+
+    <div class="brandrow">
+      <img class="brandlogo big" id="logoPrev" alt="" hidden>
+      <div class="brandtext">
+        <div class="brandtitle">Your logo</div>
+        <div class="meta" id="logoNote"></div>
+      </div>
+      <div class="brandbtns">
+        <button class="btn ghost" id="logoPick">Choose image</button>
+        <button class="btn ghost" id="logoDrop" hidden>Remove</button>
+      </div>
+      <input type="file" id="logoIn" accept="image/png,image/jpeg,image/gif,image/webp">
     </div>
   </section>
 
@@ -1364,6 +1493,7 @@ function render(){
   $('#dest').textContent = S.dest;
   $('#snippet').textContent = S.snippet;
   $('#dropurl').textContent = S.dropUrl;
+  logo();
   $('#listening').textContent = 'listening on ' + S.base +
     (S.chunk ? '   ·   split into ' + S.chunk + 'MB requests' : '');
   if (document.activeElement !== $('#excl')) $('#excl').value = S.exclude;
@@ -1409,6 +1539,39 @@ $('#excl').oninput = () => {
   const v = $('#excl').value;
   exclTimer = setTimeout(() => api('/api/exclude', {exclude:v}).catch(()=>{}), 350);
 };
+
+function logo(){
+  // ?v= busts the cache: same URL, new bytes after an upload
+  const src = '/api/logo?k=' + encodeURIComponent(K) + '&v=' + S.logoV;
+  for (const el of [$('#logo'), $('#logoPrev')]){
+    el.hidden = !S.logo;
+    if (S.logo && el.getAttribute('src') !== src) el.src = src;
+  }
+  $('#logoDrop').hidden = !S.logo;
+  $('#logoPick').textContent = S.logo ? 'Replace' : 'Choose image';
+  $('#logoNote').textContent = S.logo
+    ? 'Shown here and on the EasyDrop page you share.'
+    : 'PNG, JPEG, GIF or WebP. Shown here and on the EasyDrop page you share.';
+}
+
+$('#logoPick').onclick = () => $('#logoIn').click();
+$('#logoIn').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';                 // so the same file can be picked again
+  if (!f) return;
+  $('#logoNote').textContent = 'Uploading ...';
+  try {
+    const r = await fetch('/api/logo', {method:'POST',
+      headers:{'X-UI-Token':K, 'Content-Type': f.type || 'application/octet-stream'},
+      body:f});
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok || !out.ok) throw new Error(out.error || r.statusText);
+  } catch (err) {
+    $('#logoNote').textContent = 'Could not use that image — ' + err.message;
+  }
+};
+$('#logoDrop').onclick = () =>
+  api('/api/logo/clear', {}).catch(e => alert(e.message));
 
 async function copyBtn(btn, text, label){
   try { await navigator.clipboard.writeText(text); }
@@ -1498,7 +1661,11 @@ pre.mark{margin:0;color:var(--accent);font-family:ui-monospace,SFMono-Regular,
   Menlo,Consolas,monospace;font-size:clamp(4px,1.35vw,10px);line-height:1.12;
   font-weight:600}
 .tag{color:var(--mute);font-size:13px;margin-top:8px}
-header{margin-bottom:20px}
+header{margin-bottom:20px;display:flex;align-items:center;gap:18px;
+  justify-content:space-between;flex-wrap:wrap}
+.hgroup{min-width:0}
+/* whoever is sending sees who they are sending to */
+.brandlogo{max-height:60px;max-width:190px;object-fit:contain;flex:none}
 /* inline-block so the parent centres the art as one unit - centring a <pre>
    line by line would stagger it */
 pre.target{display:inline-block;text-align:left;margin:0 0 14px;
@@ -1569,6 +1736,7 @@ input[type=file]{display:none}
 </style></head><body>
 <div class="wrap">
   <header>
+    <div class="hgroup">
     <h1 class="sr">EasyDrop</h1>
     <pre class="mark" aria-hidden="true"> _____                      ____
 | ____|  __ _  ___   _   _ |  _ \  _ __   ___   _ __
@@ -1577,6 +1745,8 @@ input[type=file]{display:none}
 |_____| \__,_||___/  \__, ||____/ |_|    \___/ | .__/
                      |___/                     |_|</pre>
     <div class="tag">drop files here and they land on the other machine</div>
+    </div>
+    <img class="brandlogo" id="logo" alt="" hidden>
   </header>
 
   <div id="fail" class="err" hidden></div>
@@ -1649,6 +1819,11 @@ fetch('/drop/config', {headers: {'X-Token': KEY}})
     $('#note').textContent = 'Uploads land in the ' + c.dest +
       ' folder on the receiving machine.' +
       (CHUNK ? ' Large files are sent in ' + CHUNK + 'MB pieces.' : '');
+    if (c.logo) {
+      const img = $('#logo');
+      img.onload = () => { img.hidden = false; };
+      img.src = '/drop/logo?k=' + encodeURIComponent(KEY) + '&v=' + c.logoV;
+    }
   })
   .catch(() => {});
 
@@ -1932,6 +2107,16 @@ class Control(BaseHTTPRequestHandler):
             return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         if not self._authed():
             return self._send(403, b"bad or missing key\n")
+        if path == "/api/logo":
+            if not LOGO["data"]:
+                return self._send(404, b"no logo\n")
+            self.send_response(200)
+            self.send_header("Content-Type", LOGO["type"])
+            self.send_header("Content-Length", str(len(LOGO["data"])))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return self.wfile.write(LOGO["data"])
         if path == "/api/state":
             state = self.app.as_dict()
             state["log"] = [{"line": l, "cls": log_class(l.partition("] ")[2])}
@@ -1947,13 +2132,32 @@ class Control(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(403, b"bad or missing key\n")
         path = urlparse(self.path).path
+        length = _int(self.headers.get("Content-Length"), 0)
+
+        # the logo arrives as raw image bytes, so read it before anything
+        # tries to parse the body as JSON
+        if path == "/api/logo":
+            if length > LOGO_MAX:
+                return self._json({"ok": False,
+                                   "error": f"too big - keep it under "
+                                            f"{human(LOGO_MAX)}"}, 413)
+            ok, msg = set_logo(self.rfile.read(length))
+            if ok:
+                self.app.push()
+            return self._json({"ok": ok, "error": None if ok else msg},
+                              200 if ok else 400)
+
         try:
-            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            raw = self.rfile.read(length)
             body = json.loads(raw or b"{}")
         except Exception:
             body = {}
         app = self.app
 
+        if path == "/api/logo/clear":
+            clear_logo()
+            app.push()
+            return self._json({"ok": True})
         if path == "/api/connect":
             app.apply_async(**{k: body.get(k) for k in
                                ("mode", "hostname", "tunnel_name",
@@ -2099,7 +2303,7 @@ HELP = """
 
 REPO = "github.com/roninimous/easycp"
 
-LOGO = r"""
+WORDMARK = r"""
     ___   __ _  ___   _   _   ___  _ __
    / _ \ / _` |/ __| | | | | / __|| '_ \
   |  __/| (_| |\__ \ | |_| || (__ | |_) |
@@ -2109,7 +2313,7 @@ LOGO = r"""
 
 
 def banner(app):
-    out = [paint(LOGO, BOLD)]
+    out = [paint(WORDMARK, BOLD)]
     out.append(f"  saving to   {tilde(DEST)}")
     out.append(f"  listening   {app.base}")
     if app.chunk:
@@ -2280,11 +2484,14 @@ def main():
 
     DEST = Path(args.dest).expanduser()
     AUTO_EXTRACT = not args.no_extract
-    DEST.mkdir(parents=True, exist_ok=True)
 
     LOG_SINKS.append(term_sink)
     LOG_SINKS.append(lambda line: BUS.publish(
         "log", {"line": line, "cls": log_class(line.partition("] ")[2])}))
+
+    DEST = adopt_old_dest(DEST)
+    DEST.mkdir(parents=True, exist_ok=True)
+    load_logo()
 
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", args.port), Receiver)
@@ -2329,7 +2536,7 @@ def main():
     ui_port = start_control(app, args.ui_port)
     ui_url = f"http://127.0.0.1:{ui_port}/?k={UI_TOKEN}"
     print()
-    print(paint(LOGO, BOLD))
+    print(paint(WORDMARK, BOLD))
     print(f"  control panel at {ui_url}")
     print(paint(f"  {REPO}", DIM))
     print(f"  saving to   {tilde(DEST)}")
