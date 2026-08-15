@@ -676,7 +676,9 @@ def take_share(sid, key):
         share = SHARES.get(sid)
         if not share or not secrets.compare_digest(key, share["token"]):
             return None
-        return SHARES.pop(sid)
+        share = SHARES.pop(sid)
+    BUS.publish("share", {"id": sid, "alive": False})
+    return share
 
 
 def regen_share(sid):
@@ -694,7 +696,8 @@ def regen_share(sid):
         new_sid = secrets.token_hex(8)
         share["token"] = secrets.token_urlsafe(16)
         SHARES[new_sid] = share
-        return new_sid, share
+    BUS.publish("share", {"id": sid, "alive": False})
+    return new_sid, share
 
 
 def tar_folder(path):
@@ -1767,7 +1770,10 @@ def log_class(msg):
         return "dim"
     if "failed" in low or low.startswith("could not"):
         return "bad"
-    if low.startswith(("copied", "sent", "joined", "unpacked", "listening")):
+    if low.startswith(("share downloaded", "share interrupted")):
+        return "bad"
+    if low.startswith(("copied", "sent", "joined", "unpacked", "listening",
+                       "share ready", "share re-linked")):
         return "ok"
     if low.startswith(("receiving", "connecting", "switching", "opening",
                        "starting", "waiting", "creating", "routing")):
@@ -2182,7 +2188,7 @@ input[type=file]{display:none}
     <div class="foot" id="shareFoot" hidden>
       <button class="btn ghost" id="shareCopy">Copy link</button>
       <button class="btn ghost" id="shareRegen">Regenerate link</button>
-      <span class="meta">Good for one download, then it's gone.</span>
+      <span class="pill"><i class="dot" id="shareDot"></i><span id="shareStatus"></span></span>
     </div>
   </section>
 
@@ -2393,11 +2399,16 @@ $('#copylink').onclick = () =>
 function shareNote(msg){ $('#shareNote').textContent = msg; }
 
 let shareId = null;
+function shareDot(alive){
+  $('#shareDot').className = 'dot ' + (alive ? 'live' : 'error');
+  $('#shareStatus').textContent = alive ? 'live — one download and it\'s gone' : 'used — link is dead';
+}
 function showShareLink(url, name, id, note){
   shareId = id;
   $('#shareLink').textContent = url;
   $('#shareLink').hidden = false;
   $('#shareFoot').hidden = false;
+  shareDot(true);
   shareNote(note || (name + ' — ready to share'));
 }
 
@@ -2459,6 +2470,9 @@ function listen(){
   es.onmessage = e => {
     const msg = JSON.parse(e.data);
     if (msg.kind === 'log') addLog(msg.data);
+    else if (msg.kind === 'share'){
+      if (msg.data.id === shareId && !msg.data.alive) shareDot(false);
+    }
     else if (msg.kind === 'state'){
       const focused = document.activeElement;
       const keep = focused && focused.dataset && focused.dataset.key;

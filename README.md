@@ -262,7 +262,9 @@ without opening up the whole `send` pipeline. **Choose file** (or **Choose
 folder**) under Share uploads it to easycp and hands back a link; a folder
 goes out as a `.tar.gz`. Open the link once and the download starts; open it
 again and it 404s — the link is good for exactly one download, and easycp
-logs it the moment that happens.
+logs it the moment that happens. A dot next to the link tracks this live:
+green while the link is still good, red the instant it's opened (or
+regenerated away) — no need to go dig through the log to check.
 
 Same thing at the `--headless` prompt: `share <path>` works on anything
 already on disk, file or folder, no upload needed since it's local already.
