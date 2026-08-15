@@ -41,6 +41,7 @@ Both front ends can do the same thing without any flags.
 import argparse
 import atexit
 import base64
+import html
 import json
 import mimetypes
 import os
@@ -646,48 +647,83 @@ def clear_logo():
 
 
 # --------------------------------------------------------------------------
-# sharing - hand out a one-time link to a single file (a folder goes out as
-# a .tar.gz, same as `peek -r`/`send -r` package one for the VPS snippet)
+# sharing - hand out a link that can carry several files at once. Files can
+# be added to it at any time and it stays live until it is deleted (a folder
+# goes out as a .tar.gz, same as `peek -r`/`send -r` package one for the VPS
+# snippet)
 # --------------------------------------------------------------------------
 
 SHARE_DIR = Path(tempfile.mkdtemp(prefix="easycp-share-"))
 atexit.register(shutil.rmtree, SHARE_DIR, ignore_errors=True)
 
 SHARES_LOCK = threading.Lock()
-SHARES = {}              # id -> {path, name, ctype, token, cleanup}
+SHARES = {}              # id -> {token, created, files: {fid: {path, name, ctype, cleanup, size}}}
 SHARE_BATCHES_LOCK = threading.Lock()
 SHARE_BATCHES = {}       # id -> {dir, root}  (a folder mid-upload from the panel)
 
 
-def make_share(path, cleanup):
-    """Register path for one download. Returns (id, token) for the link."""
+def make_share():
+    """Start a new, empty share. Returns (id, token) for the link."""
     sid = secrets.token_hex(8)
     token = secrets.token_urlsafe(16)
-    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     with SHARES_LOCK:
-        SHARES[sid] = {"path": path, "name": path.name, "ctype": ctype,
-                       "token": token, "cleanup": cleanup}
+        SHARES[sid] = {"token": token, "created": time.time(), "files": {}}
     return sid, token
 
 
-def take_share(sid, key):
-    """Redeem a link: valid once, then gone even if the download fails."""
+def add_share_file(sid, path, cleanup):
+    """Add a file to a still-live share. Returns its file id, or None if
+    the share was already deleted (or never existed)."""
+    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    fid = secrets.token_hex(6)
     with SHARES_LOCK:
         share = SHARES.get(sid)
-        if not share or not secrets.compare_digest(key, share["token"]):
+        if not share:
             return None
-        share = SHARES.pop(sid)
+        share["files"][fid] = {"path": path, "name": path.name, "ctype": ctype,
+                               "cleanup": cleanup, "size": size}
+    BUS.publish("share", {"id": sid, "alive": True})
+    return fid
+
+
+def get_share(sid, key):
+    """Look up a live share by id+token, without consuming anything."""
+    with SHARES_LOCK:
+        share = SHARES.get(sid)
+        if not share or not key or not secrets.compare_digest(key, share["token"]):
+            return None
+        return share
+
+
+def share_files_json(share):
+    return [{"id": fid, "name": f["name"], "size": f["size"]}
+            for fid, f in sorted(share["files"].items(),
+                                 key=lambda kv: kv[1]["name"].lower())]
+
+
+def delete_share(sid):
+    """Revoke a share link outright, deleting every file we own a copy of."""
+    with SHARES_LOCK:
+        share = SHARES.pop(sid, None)
+    if not share:
+        return False
+    for f in share["files"].values():
+        if f["cleanup"]:
+            f["path"].unlink(missing_ok=True)
     BUS.publish("share", {"id": sid, "alive": False})
-    return share
+    return True
 
 
 def regen_share(sid):
     """Rotate a still-live share onto a new id/token. The old link dies the
-    instant this runs; the file underneath, and its name, do not change.
+    instant this runs; the files underneath, and their names, do not change.
 
     Returns (new_id, share) for the fresh link, or None if `sid` was already
-    downloaded, revoked, or never existed - regenerating only makes sense
-    for a link nobody has used yet.
+    deleted or never existed.
     """
     with SHARES_LOCK:
         share = SHARES.pop(sid, None)
@@ -733,37 +769,82 @@ def close_share_batch(bid):
         return SHARE_BATCHES.pop(bid, None)
 
 
-# headless only: the most recent live share id for each path, so `share
-# <path>` a second time rotates that link instead of stacking another one
-LAST_SHARE = {}
+def _share_lines(app, sid, share):
+    url = f"{app.base}/s/{sid}?k={share['token']}"
+    files = sorted(share["files"].values(), key=lambda f: f["name"].lower())
+    lines = [f"\n     {url}\n", f"     {plural(len(files), 'file')} on this link:\n"]
+    lines += [f"       - {f['name']}  ({human(f['size'])})\n" for f in files]
+    lines.append(f"     share add {sid} <path>  adds more - share delete {sid}  revokes it\n")
+    return lines
 
 
-def share_command(app, path_arg):
-    """Implements the `share <path>` prompt command. Returns lines to print."""
+def _stage_and_add(sid, path_arg):
+    """Shared by the `share` and `share add` branches: stage `path_arg` and
+    drop it onto share `sid`. Returns None on success (already logged), or
+    lines to print on failure."""
     p = Path(path_arg).expanduser()
     if not p.exists():
         return [f"  no such file or folder: {p}"]
-    key = str(p.resolve())
-    prev = LAST_SHARE.get(key)
-    regen = regen_share(prev) if prev else None
-    if regen:
-        sid, share = regen
-        token, name = share["token"], share["name"]
-        log(f"share re-linked: {name} - the old link is dead")
-        tail = "the previous link for this is now dead"
-    else:
-        try:
-            served, cleanup = stage_share(p)
-        except Exception as e:
-            return [f"  could not prepare that: {e}"]
-        sid, token = make_share(served, cleanup)
-        name = served.name
-        what = "folder, tarred" if p.is_dir() else human(served.stat().st_size)
-        log(f"share ready: {name}  ({what})")
-        tail = "one download and it's gone"
-    LAST_SHARE[key] = sid
-    url = f"{app.base}/s/{sid}?k={token}"
-    return [f"\n     {url}\n", f"     {tail}\n"]
+    try:
+        served, cleanup = stage_share(p)
+    except Exception as e:
+        return [f"  could not prepare that: {e}"]
+    if add_share_file(sid, served, cleanup) is None:
+        return [f"  no such share: {sid}"]
+    what = "folder, tarred" if p.is_dir() else human(served.stat().st_size)
+    log(f"share ready: {served.name}  ({what})")
+    return None
+
+
+def share_command(app, rest):
+    """Implements the `share` prompt command family:
+        share <path>            start a brand-new link for a file/folder
+        share add <id> <path>   add a file/folder to an existing link
+        share delete <id>       revoke a link and delete everything on it
+        share list              list active links
+    """
+    rest = (rest or "").strip()
+    sub, _, tail = rest.partition(" ")
+    tail = tail.strip()
+
+    if sub == "list":
+        if not SHARES:
+            return ["  no active share links"]
+        lines = []
+        for sid, share in SHARES.items():
+            n = plural(len(share["files"]), "file")
+            lines.append(f"  {sid}  ({n})  {app.base}/s/{sid}?k={share['token']}")
+        return lines
+
+    if sub == "delete":
+        if not tail:
+            return ["  usage: share delete <id>  (see `share list` for ids)"]
+        if not delete_share(tail):
+            return [f"  no such share: {tail}"]
+        log("share deleted - the link is dead")
+        return ["  share link deleted"]
+
+    if sub == "add":
+        sid, _, path_part = tail.partition(" ")
+        path_part = unescape_path(path_part.strip())
+        if not sid or not path_part:
+            return ["  usage: share add <id> <path>  (see `share list` for ids)"]
+        failed = _stage_and_add(sid, path_part)
+        if failed:
+            return failed
+        return _share_lines(app, sid, SHARES[sid])
+
+    if not rest:
+        return ["  usage: share <path>  |  share add <id> <path>  |  "
+                "share delete <id>  |  share list"]
+
+    # a bare path always starts a brand-new link
+    sid, _token = make_share()
+    failed = _stage_and_add(sid, unescape_path(rest))
+    if failed:
+        delete_share(sid)
+        return failed
+    return _share_lines(app, sid, SHARES[sid])
 
 
 OLD_DEST = Path.home() / "DropZone"
@@ -1254,24 +1335,49 @@ class Receiver(BaseHTTPRequestHandler):
                                "dest": DEST.name,
                                "logo": bool(LOGO["data"]), "logoV": LOGO["v"]})
         if parsed.path.startswith("/s/"):
-            # a share link carries its own one-time token - not the drop key
-            sid = parsed.path[len("/s/"):].strip("/")
+            # a share link carries its own token - not the drop key - and
+            # stays live across downloads until the sharer deletes it
             key = parse_qs(parsed.query).get("k", [""])[0]
-            share = take_share(sid, key)
-            if not share:
-                return self._reply(404, b"this link is used up, or never existed\n")
-            return self._serve_share(share)
+            parts = parsed.path[len("/s/"):].strip("/").split("/")
+            if len(parts) == 3 and parts[1] == "f":
+                return self._serve_share_file(parts[0], key, parts[2])
+            return self._serve_share_page(parts[0], key)
         self._reply(200, b"easycp is listening.\n")
 
-    def _serve_share(self, share):
-        path, name, cleanup = share["path"], share["name"], share["cleanup"]
+    def _serve_share_page(self, sid, key):
+        share = get_share(sid, key)
+        if not share:
+            return self._reply(404, b"this link is unknown, or was deleted\n")
+        files = sorted(share["files"].items(), key=lambda kv: kv[1]["name"].lower())
+        if not files:
+            rows = '<div class="empty">nothing shared here yet</div>'
+        else:
+            rows = "".join(
+                f'<div class="row"><div class="nm">{html.escape(f["name"])}</div>'
+                f'<div class="sz">{human(f["path"].stat().st_size) if f["path"].exists() else "gone"}</div>'
+                f'<a class="btn" href="/s/{sid}/f/{fid}?k={key}">Download</a></div>'
+                for fid, f in files
+            )
+        subtitle = plural(len(files), "file") + " shared with this link"
+        page = (SHARE_PAGE_HEAD + html.escape(subtitle) + SHARE_PAGE_MID
+                + rows + SHARE_PAGE_TAIL)
+        self._reply(200, page.encode(), "text/html; charset=utf-8")
+
+    def _serve_share_file(self, sid, key, fid):
+        share = get_share(sid, key)
+        if not share:
+            return self._reply(404, b"this link is unknown, or was deleted\n")
+        f = share["files"].get(fid)
+        if not f:
+            return self._reply(404, b"that file is no longer on this link\n")
+        path, name = f["path"], f["name"]
         try:
             size = path.stat().st_size
         except OSError:
             log(f"share failed: {name} is gone from disk")
             return self._reply(404, b"that file is gone\n")
         self.send_response(200)
-        self.send_header("Content-Type", share["ctype"])
+        self.send_header("Content-Type", f["ctype"])
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Disposition",
                          f'attachment; filename="{name.replace(chr(34), chr(39))}"')
@@ -1280,19 +1386,16 @@ class Receiver(BaseHTTPRequestHandler):
         self.end_headers()
         sent = 0
         try:
-            with open(path, "rb") as f:
+            with open(path, "rb") as fh:
                 while True:
-                    chunk = f.read(262144)
+                    chunk = fh.read(262144)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     sent += len(chunk)
-            log(f"share downloaded: {name}  {human(sent)} - link is now dead")
+            log(f"share downloaded: {name}  {human(sent)}")
         except Exception as e:
-            log(f"share interrupted: {name}  ({human(sent)} sent, {e}) - link is now dead")
-        finally:
-            if cleanup:
-                path.unlink(missing_ok=True)
+            log(f"share interrupted: {name}  ({human(sent)} sent, {e})")
 
 
 # --------------------------------------------------------------------------
@@ -2062,6 +2165,16 @@ pre.code{white-space:pre-wrap;word-break:break-all;max-height:190px;overflow:aut
 #log .dim{color:#8b9ab1} #log .msg{color:var(--panel-ink)}
 .foot{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
 .meta{color:var(--mute);font-size:12.5px}
+.filelist{border:1px solid var(--line);border-radius:9px;overflow:hidden;margin-top:2px}
+.filelist .f{display:flex;align-items:center;gap:10px;padding:8px 12px;
+  font-size:12.5px;border-bottom:1px solid var(--line)}
+.filelist .f:last-child{border-bottom:none}
+.filelist .f .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.filelist .f .sz{color:var(--faint);font-variant-numeric:tabular-nums}
+.sharecard{border:1px solid var(--line);border-radius:10px;padding:13px 14px;margin-top:10px}
+.sharecard pre.code{margin:0 0 8px;max-height:none}
+.sharecard .foot{margin-top:10px}
 code.k{background:var(--accent-soft);color:var(--accent);border-radius:5px;padding:1px 6px;
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .err{background:var(--bad);color:#fff;padding:10px 14px;border-radius:9px;margin-bottom:14px}
@@ -2175,21 +2288,16 @@ input[type=file]{display:none}
 
   <section class="card">
     <div class="chead"><h2>Share a file or folder</h2>
-      <span class="sub">a one-time link &mdash; it dies the moment it's opened</span>
+      <span class="sub">each share gets its own link &mdash; add more to one from its own card</span>
     </div>
     <div class="brandbtns">
-      <button class="btn ghost" id="sharePick">Choose file</button>
-      <button class="btn ghost" id="shareFolderPick">Choose folder</button>
+      <button class="btn ghost" id="sharePick">Share a new file</button>
+      <button class="btn ghost" id="shareFolderPick">Share a new folder</button>
     </div>
     <input type="file" id="shareIn">
     <input type="file" id="shareFolderIn" webkitdirectory multiple>
     <div class="meta" id="shareNote"></div>
-    <pre class="code" id="shareLink" hidden></pre>
-    <div class="foot" id="shareFoot" hidden>
-      <button class="btn ghost" id="shareCopy">Copy link</button>
-      <button class="btn ghost" id="shareRegen">Regenerate link</button>
-      <span class="pill"><i class="dot" id="shareDot"></i><span id="shareStatus"></span></span>
-    </div>
+    <div id="shareLinks"></div>
   </section>
 
   <section class="card">
@@ -2397,45 +2505,131 @@ $('#copylink').onclick = () =>
   copyBtn($('#copylink'), S ? S.dropUrl : '', 'Copy link');
 
 function shareNote(msg){ $('#shareNote').textContent = msg; }
-
-let shareId = null;
-function shareDot(alive){
-  $('#shareDot').className = 'dot ' + (alive ? 'live' : 'error');
-  $('#shareStatus').textContent = alive ? 'live — one download and it\'s gone' : 'used — link is dead';
+function shareHuman(n){
+  const units = ['B','KB','MB','GB'];
+  n = Number(n) || 0;
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n.toFixed(0) : n.toFixed(1)) + units[i];
 }
-function showShareLink(url, name, id, note){
-  shareId = id;
-  $('#shareLink').textContent = url;
-  $('#shareLink').hidden = false;
-  $('#shareFoot').hidden = false;
-  shareDot(true);
-  shareNote(note || (name + ' — ready to share'));
+function sharePlural(n, word){ return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+// each entry is its own link - sid -> {url, files, alive}. Nothing here
+// ever merges two entries: the only way files land on the same link is
+// through that link's own "Add file/folder" buttons (see pendingShareId).
+const shareCards = {};
+let pendingShareId = null;   // null = the next upload starts a brand-new link
+
+function shareBtn(label, onclick){
+  const b = document.createElement('button');
+  b.className = 'btn ghost';
+  b.textContent = label;
+  b.onclick = onclick;
+  return b;
 }
 
-$('#sharePick').onclick = () => $('#shareIn').click();
+function renderShareCards(){
+  const box = $('#shareLinks');
+  box.innerHTML = '';
+  Object.keys(shareCards).forEach(sid => {
+    const c = shareCards[sid];
+    const card = document.createElement('div');
+    card.className = 'sharecard';
+
+    const link = document.createElement('pre');
+    link.className = 'code';
+    link.textContent = c.url;
+    card.appendChild(link);
+
+    if (c.files && c.files.length){
+      const list = document.createElement('div');
+      list.className = 'filelist';
+      c.files.forEach(f => {
+        const row = document.createElement('div');
+        row.className = 'f';
+        const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = f.name;
+        const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = shareHuman(f.size);
+        row.append(nm, sz);
+        list.appendChild(row);
+      });
+      card.appendChild(list);
+    }
+
+    const foot = document.createElement('div');
+    foot.className = 'foot';
+    const copyEl = shareBtn('Copy link', () => copyBtn(copyEl, c.url, 'Copy link'));
+    foot.appendChild(copyEl);
+    if (c.alive){
+      foot.appendChild(shareBtn('Add file', () => { pendingShareId = sid; $('#shareIn').click(); }));
+      foot.appendChild(shareBtn('Add folder', () => { pendingShareId = sid; $('#shareFolderIn').click(); }));
+      foot.appendChild(shareBtn('Regenerate', () => regenShareCard(sid)));
+      foot.appendChild(shareBtn('Delete', () => deleteShareCard(sid)));
+    }
+    const pill = document.createElement('span');
+    pill.className = 'pill';
+    const dot = document.createElement('i');
+    dot.className = 'dot ' + (c.alive ? 'live' : 'error');
+    const status = document.createElement('span');
+    status.textContent = c.alive
+      ? sharePlural((c.files || []).length, 'file') + ' — live'
+      : 'deleted — link is dead';
+    pill.append(dot, status);
+    foot.appendChild(pill);
+    card.appendChild(foot);
+
+    box.appendChild(card);
+  });
+}
+
+async function regenShareCard(sid){
+  shareNote('Regenerating ...');
+  try {
+    const out = await api('/api/share/regen', {id: sid});
+    delete shareCards[sid];
+    shareCards[out.id] = {url: out.url, files: out.files, alive: true};
+    renderShareCards();
+    shareNote('');
+  } catch (err) { shareNote('Could not regenerate — ' + err.message); }
+}
+
+async function deleteShareCard(sid){
+  if (!confirm('Delete this share link? Anyone holding it loses access to every file on it.')) return;
+  shareNote('Deleting ...');
+  try {
+    await api('/api/share/delete', {id: sid});
+    delete shareCards[sid];
+    renderShareCards();
+    shareNote('');
+  } catch (err) { shareNote('Could not delete — ' + err.message); }
+}
+
+$('#sharePick').onclick = () => { pendingShareId = null; $('#shareIn').click(); };
 $('#shareIn').onchange = async e => {
   const f = e.target.files[0];
   e.target.value = '';
   if (!f) return;
-  $('#shareFoot').hidden = true; $('#shareLink').hidden = true;
+  const targetId = pendingShareId;
   shareNote('Uploading ...');
   try {
     const r = await fetch('/api/share', {method:'POST',
       headers:{'X-UI-Token':K, 'Content-Type': f.type || 'application/octet-stream',
-               'X-Share-Name': encodeURIComponent(f.name)},
+               'X-Share-Name': encodeURIComponent(f.name),
+               'X-Share-Id': targetId || ''},
       body: f});
     const out = await r.json().catch(() => ({}));
     if (!r.ok || !out.ok) throw new Error(out.error || r.statusText);
-    showShareLink(out.url, out.name, out.id);
+    shareCards[out.id] = {url: out.url, files: out.files, alive: true};
+    renderShareCards();
+    shareNote('');
   } catch (err) { shareNote('Could not share that — ' + err.message); }
 };
 
-$('#shareFolderPick').onclick = () => $('#shareFolderIn').click();
+$('#shareFolderPick').onclick = () => { pendingShareId = null; $('#shareFolderIn').click(); };
 $('#shareFolderIn').onchange = async e => {
   const files = Array.from(e.target.files);
   e.target.value = '';
   if (!files.length) return;
-  $('#shareFoot').hidden = true; $('#shareLink').hidden = true;
+  const targetId = pendingShareId;
   const root = (files[0].webkitRelativePath || files[0].name).split('/')[0];
   shareNote(`Uploading ${files.length} file${files.length === 1 ? '' : 's'} ...`);
   try {
@@ -2449,20 +2643,11 @@ $('#shareFolderIn').onchange = async e => {
       const out = await r.json().catch(() => ({}));
       if (!r.ok || !out.ok) throw new Error(out.error || r.statusText);
     }
-    const done = await api('/api/share/end', {id: begin.id});
-    showShareLink(done.url, done.name, done.id);
+    const done = await api('/api/share/end', {id: begin.id, shareId: targetId || ''});
+    shareCards[done.id] = {url: done.url, files: done.files, alive: true};
+    renderShareCards();
+    shareNote('');
   } catch (err) { shareNote('Could not share that folder — ' + err.message); }
-};
-
-$('#shareCopy').onclick = () =>
-  copyBtn($('#shareCopy'), $('#shareLink').textContent, 'Copy link');
-$('#shareRegen').onclick = async () => {
-  if (!shareId) return;
-  shareNote('Regenerating ...');
-  try {
-    const out = await api('/api/share/regen', {id: shareId});
-    showShareLink(out.url, out.name, out.id, out.name + ' — new link, the old one is dead');
-  } catch (err) { shareNote('Could not regenerate — ' + err.message); }
 };
 
 function listen(){
@@ -2471,7 +2656,8 @@ function listen(){
     const msg = JSON.parse(e.data);
     if (msg.kind === 'log') addLog(msg.data);
     else if (msg.kind === 'share'){
-      if (msg.data.id === shareId && !msg.data.alive) shareDot(false);
+      const c = shareCards[msg.data.id];
+      if (c && c.alive !== msg.data.alive) { c.alive = msg.data.alive; renderShareCards(); }
     }
     else if (msg.kind === 'state'){
       const focused = document.activeElement;
@@ -2495,6 +2681,13 @@ function listen(){
   }
   modeCards(); render();
   (S.log || []).forEach(addLog);
+  try {
+    const shares = await api('/api/shares');
+    (shares.shares || []).forEach(c => {
+      shareCards[c.id] = {url: c.url, files: c.files, alive: true};
+    });
+    renderShareCards();
+  } catch (e) { /* share links just won't show until the next action */ }
   listen();
 })();
 </script></body></html>
@@ -2977,6 +3170,62 @@ window.addEventListener('beforeunload', e => {
 </script></body></html>
 """
 
+# the recipient's landing page for a share link - lists whatever is on it
+# right now, so it is built server-side per request rather than templated
+SHARE_PAGE_HEAD = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shared with you</title>
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M16 6v13m0 0l-5-5m5 5l5-5M8 25h16' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<style>
+:root{
+  --bg:#f4f6fb; --card:#fff; --line:#e3e8f0; --ink:#0f172a; --mute:#5b6577;
+  --faint:#94a0b3; --accent:#2563eb; --accent-ink:#fff;
+  --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0a0f1d; --card:#121a2c; --line:#22304a; --ink:#e8edf7; --mute:#9aa8bf;
+    --faint:#6b7a93; --accent:#4f83f1; --shadow:none;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:640px;margin:0 auto;padding:34px 22px 48px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--mute);font-size:13px;margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:var(--shadow);overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;padding:13px 16px;
+  border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-weight:550}
+.sz{color:var(--mute);font-size:12.5px;font-variant-numeric:tabular-nums;flex:none}
+.btn{border:1px solid transparent;border-radius:9px;padding:7px 14px;font:inherit;
+  font-size:13px;font-weight:550;cursor:pointer;background:var(--accent);
+  color:var(--accent-ink);text-decoration:none;flex:none}
+.btn:hover{filter:brightness(1.07)}
+.empty{padding:26px 16px;text-align:center;color:var(--mute)}
+.wm{display:flex;align-items:center;gap:8px;justify-content:center;
+  margin-top:24px;font-size:12px;color:var(--faint)}
+</style></head>
+<body><div class="wrap">
+<h1>Shared with you</h1>
+<p class="sub">"""
+
+SHARE_PAGE_MID = """</p>
+<div class="card">
+"""
+
+SHARE_PAGE_TAIL = """</div>
+<div class="wm">easycp</div>
+</div></body></html>"""
+
 
 # --------------------------------------------------------------------------
 # control server - local only, this is what the browser talks to
@@ -3042,9 +3291,16 @@ class Control(BaseHTTPRequestHandler):
                 total += len(chunk)
         return total
 
-    def _share_url(self, path, cleanup):
-        sid, token = make_share(path, cleanup)
-        return sid, f"{self.app.base}/s/{sid}?k={token}", path.name
+    def _share_add(self, sid, path, cleanup):
+        """Add `path` to share `sid` if it is still live, else start a new
+        share for it. Returns (sid, url, share)."""
+        fid = add_share_file(sid, path, cleanup) if sid else None
+        if fid is None:
+            sid, _token = make_share()
+            add_share_file(sid, path, cleanup)
+        share = SHARES[sid]
+        url = f"{self.app.base}/s/{sid}?k={share['token']}"
+        return sid, url, share
 
     # -- routes ----------------------------------------------------------
     def do_GET(self):
@@ -3070,6 +3326,13 @@ class Control(BaseHTTPRequestHandler):
             state["log"] = [{"line": l, "cls": log_class(l.partition("] ")[2])}
                             for l in LOG_HISTORY[-300:]]
             return self._json(state)
+        if path == "/api/shares":
+            with SHARES_LOCK:
+                shares = [{"id": sid,
+                          "url": f"{self.app.base}/s/{sid}?k={share['token']}",
+                          "files": share_files_json(share)}
+                         for sid, share in SHARES.items()]
+            return self._json({"shares": shares})
         if path == "/api/events":
             return self._stream()
         self._send(404, b"not here\n")
@@ -3103,9 +3366,11 @@ class Control(BaseHTTPRequestHandler):
             except Exception as e:
                 dest.unlink(missing_ok=True)
                 return self._json({"ok": False, "error": str(e)}, 500)
-            sid, url, name = self._share_url(dest, cleanup=True)
-            log(f"share ready: {name}  {human(n)}")
-            return self._json({"ok": True, "url": url, "name": name, "id": sid})
+            target_sid = self.headers.get("X-Share-Id", "")
+            sid, url, share = self._share_add(target_sid, dest, cleanup=True)
+            log(f"share added: {dest.name}  {human(n)}")
+            return self._json({"ok": True, "url": url, "id": sid,
+                               "files": share_files_json(share)})
 
         if path == "/api/share/file":
             bid = self.headers.get("X-Batch", "")
@@ -3161,9 +3426,11 @@ class Control(BaseHTTPRequestHandler):
                 shutil.rmtree(batch["dir"], ignore_errors=True)
                 return self._json({"ok": False, "error": str(e)}, 400)
             shutil.rmtree(batch["dir"], ignore_errors=True)
-            sid, url, name = self._share_url(archive, cleanup=True)
-            log(f"share ready: {name}")
-            return self._json({"ok": True, "url": url, "name": name, "id": sid})
+            target_sid = str(body.get("shareId") or "")
+            sid, url, share = self._share_add(target_sid, archive, cleanup=True)
+            log(f"share added: {archive.name}")
+            return self._json({"ok": True, "url": url, "id": sid,
+                               "files": share_files_json(share)})
         if path == "/api/share/regen":
             result = regen_share(str(body.get("id") or ""))
             if not result:
@@ -3171,9 +3438,16 @@ class Control(BaseHTTPRequestHandler):
                     {"ok": False, "error": "that link is already gone"}, 404)
             sid, share = result
             url = f"{app.base}/s/{sid}?k={share['token']}"
-            log(f"share re-linked: {share['name']} - the old link is dead")
-            return self._json({"ok": True, "url": url, "name": share["name"],
-                               "id": sid})
+            log("share re-linked - the old link is dead")
+            return self._json({"ok": True, "url": url, "id": sid,
+                               "files": share_files_json(share)})
+        if path == "/api/share/delete":
+            sid = str(body.get("id") or "")
+            if not delete_share(sid):
+                return self._json(
+                    {"ok": False, "error": "that link is already gone"}, 404)
+            log("share deleted - the link is dead")
+            return self._json({"ok": True})
         if path == "/api/connect":
             app.apply_async(**{k: body.get(k) for k in
                                ("mode", "hostname", "tunnel_name",
@@ -3356,8 +3630,10 @@ HELP = """
     dest [path]           show or change where files land
     open                  open that folder in the file manager
     logo [path]           show, set, or `logo remove` the drop-page logo
-    share <path>          one-time download link to a file or folder
-                          (again on the same path rotates it - old link dies)
+    share <path>          start a brand-new share link for a file or folder
+    share add <id> <path> add another file or folder to that link
+    share delete <id>     delete a share link and everything on it
+    share list            list active share links and their ids
     quit                  stop easycp
 """ % " | ".join(MODE_IDS)
 
@@ -3573,11 +3849,8 @@ def repl(app):
                 print(f"  logo: {'set' if LOGO['data'] else '(none)'}"
                       "   usage: logo <path>  |  logo remove")
         elif cmd == "share":
-            if not rest:
-                print("  usage: share <path>  (again on the same path rotates the link)")
-            else:
-                for line in share_command(app, unescape_path(rest)):
-                    print(line)
+            for line in share_command(app, rest):
+                print(line)
         else:
             print(f"  no such command: {cmd}   (try `help`)")
 

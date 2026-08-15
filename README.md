@@ -257,27 +257,35 @@ markup rather than an image, and nothing here needs it.
 
 ### Share a file or folder
 
-Sometimes it runs the other way — you want to hand someone a single file
-without opening up the whole `send` pipeline. **Choose file** (or **Choose
-folder**) under Share uploads it to easycp and hands back a link; a folder
-goes out as a `.tar.gz`. Open the link once and the download starts; open it
-again and it 404s — the link is good for exactly one download, and easycp
-logs it the moment that happens. A dot next to the link tracks this live:
-green while the link is still good, red the instant it's opened (or
-regenerated away) — no need to go dig through the log to check.
+Sometimes it runs the other way — you want to hand someone a file or two
+without opening up the whole `send` pipeline. **Share a file** (or **Share a
+folder**) under Share uploads it to easycp and hands back a link of its own;
+a folder goes out as a `.tar.gz`. Each click starts a brand-new link — files
+don't get lumped together unless you say so. The link opens to a page
+listing everything shared on it, each with its own download button, and it
+stays live: nothing expires on download. If you want to drop more files onto
+a link you already made, use **Add file** / **Add folder** on that specific
+link's own card — that's the only thing that adds to an existing link. A dot
+on each card tracks it live: green while it's still up, red the instant it's
+deleted (or regenerated away) — no need to go dig through the log to check.
+Reload the panel and every still-active link reappears with its file list -
+the links live on the server, not in the browser tab.
 
-Same thing at the `--headless` prompt: `share <path>` works on anything
-already on disk, file or folder, no upload needed since it's local already.
+Same thing at the `--headless` prompt: `share <path>` always starts a fresh
+link (file or folder, no upload needed since it's local already), and prints
+its id along with the link. To add more to that particular link later, run
+`share add <id> <path>`; `share list` reprints every active link and its id
+if you've lost track.
 
-Sent it to the wrong person, or just want a clean link? **Regenerate link**
-in the panel (or running `share <path>` again at the same path) swaps in a
-fresh link for the same file and kills the old one on the spot - no
-re-upload, and no second copy of a tarred folder. It only works while the
-old link is still unopened; once someone has downloaded through it, that
-file is spent and sharing it again starts over.
+Done sharing? **Delete** on a link's card (or `share delete <id>` at the
+prompt) revokes it immediately, deleting every file that was on it.
 
-The link carries its own one-time key, not the EasyDrop upload key, so
-handing it out doesn't give anyone the ability to upload here.
+Sent one to the wrong person, or just want a clean link with the same
+files? **Regenerate** swaps in a fresh id/key for everything currently on
+that link and kills the old one on the spot - no re-upload needed.
+
+The link carries its own key, not the EasyDrop upload key, so handing it out
+doesn't give anyone the ability to upload here.
 
 ## The two front ends
 
@@ -320,8 +328,10 @@ login                 authorise cloudflared for `mode domain`
 dest [path]           show or change where files land
 open                  open that folder in the file manager
 logo [path]           show, set, or `logo remove` the drop-page logo
-share <path>          one-time download link to a file or folder
-                      (again on the same path rotates it - old link dies)
+share <path>          start a brand-new share link for a file or folder
+share add <id> <path> add another file or folder to that link
+share delete <id>     delete a share link and everything on it
+share list            list active share links and their ids
 quit                  stop easycp
 ```
 
